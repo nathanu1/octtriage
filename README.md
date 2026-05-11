@@ -1,6 +1,8 @@
 # octtriage
 Codebase being updated in progress 5/1 
 Goal: 
+Image-Based Retinal Disease Triage: OCT Classification
+
 TriageOS: an intelligence layer for urgent care that predicts acuity, patient deterioration, care bottlenecks, and the safest destination before the patient reaches the wrong door.
 
 OCT, or optical coherence tomography, is a non-invasive imaging technique that creates cross-sectional images of the retina and is widely used for diagnosing and monitoring ophthalmic disease.
