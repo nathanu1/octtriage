@@ -25,6 +25,7 @@ This software is for **education and research demonstration** only. It is **not*
 | `app/streamlit_app.py` | Local demo UI with safety copy and escalation hints. |
 | `models/saved_models/` | Default location for `best_resnet18.pt` (created after training). |
 | `reports/` | Figures, metric tables, and error-analysis notes. |
+| `scripts/prepare_kermany2018.py` | Download **Kermany 2018** from Kaggle via `kagglehub` and populate `data/raw/`. |
 
 ## Dataset layout (expected)
 
@@ -51,6 +52,27 @@ data/raw/
 
 `torchvision.datasets.ImageFolder` learns class names from folder names. Use **exact** folder names above so labels stay consistent with `src/config.py`.
 
+## Option: Kermany 2018 (Kaggle) via `kagglehub`
+
+The public dataset [`paultimothymooney/kermany2018`](https://www.kaggle.com/datasets/paultimothymooney/kermany2018) matches the four classes used here. The archive is **large (~11 GB)**; `kagglehub` caches it under your user directory after the first successful download.
+
+1. Install deps (includes `kagglehub`) and stay in the project root `oct-triage-assistant/`.
+2. If the dataset is not public for your account, configure Kaggle credentials as described in the [kagglehub README](https://github.com/Kaggle/kagglehub/blob/main/README.md) (for example `KAGGLE_USERNAME` / `KAGGLE_KEY`, or `kagglehub login`).
+3. Run the preparation script (default: **symlinks** into `data/raw/` so you do not duplicate the whole cache on disk):
+
+   ```bash
+   python3 scripts/prepare_kermany2018.py
+   ```
+
+   Useful flags:
+
+   - `--source /path/to/extracted/root` — skip download; point at an already-extracted folder (often contains `OCT2017/train` and `OCT2017/test`).
+   - `--val-fraction 0.15` — fraction of **official train** images reserved for validation when an official `test/` split exists.
+   - `--mode copy` — physically copy files into `data/raw/` instead of symlinking (uses a lot of disk).
+   - `--download-only` — only download/resolve the dataset path and exit (no changes under `data/raw/`).
+
+When the archive contains **official `train/`, `val/`, and `test/`** (typical `OCT2017/` layout), the script maps those directly into `data/raw/` (publisher split). If only `train/` + `test/` exist, it maps **test** into `data/raw/test/` and randomly holds out **`--val-fraction`** of **train** for `data/raw/val/`. The published **val** set can be small; that is normal for this dataset.
+
 ## Quickstart
 
 1. Create a virtual environment and install dependencies:
@@ -62,7 +84,7 @@ data/raw/
    pip install -r requirements.txt
    ```
 
-2. Add your split dataset under `data/raw/` as shown.
+2. Add your split dataset under `data/raw/` as shown, **or** run `python3 scripts/prepare_kermany2018.py` (see above).
 
 3. Train a baseline ResNet18 classifier:
 

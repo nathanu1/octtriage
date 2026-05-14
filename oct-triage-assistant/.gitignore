@@ -38,6 +38,10 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Local OCT data (symlinks from prepare_kermany2018 or copied images) — huge; re-run prepare on each machine
+data/raw/**/*
+!data/raw/**/.gitkeep
+
 # Trained weights (large); remove `!` exception if you intentionally version a tiny checkpoint
 models/saved_models/*.pt
 models/saved_models/*.pth
