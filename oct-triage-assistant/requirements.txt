@@ -1,0 +1,13 @@
+# Deep learning & vision
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Data & metrics
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Visualization & demo
+matplotlib>=3.7.0
+streamlit>=1.28.0
+Pillow>=10.0.0
