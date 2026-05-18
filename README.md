@@ -1,5 +1,6 @@
 # octtriage
-Codebase being updated in progress 5/1 
+Codebase being updated in progress 5/18 
+possible adds: streamlit app visualization  
 Goal: 
 Image-Based Retinal Disease Triage: OCT Classification
 
