@@ -1,9 +1,9 @@
 An end-to-end reference implementation for prioritizing retinal OCT (optical coherence tomography) studies for ophthalmologist review. It takes exported B-scan images and DICOM pixel data, runs them through a scan-quality gate, applies a transfer-learned classifier with test-time augmentation, maps the evidence to an editable urgency policy, and logs both predictions and human overrides for audit.
-# Built by Nathan Lee Yang.
+Built by Nathan Lee Yang.
 
 Decision support only. This is an educational and research prototype, not an autonomous diagnostic system. It is not FDA-cleared or CE-marked and must not be used for patient care. Clinical deployment would need device-appropriate regulatory clearance, privacy and security controls, representative multi-site validation, and prospective clinical validation under qualified ophthalmology leadership.
 
-# What the current model can and cannot detect
+What the current model can and cannot detect
 The prototype trains on the Kermany OCT2017 Kaggle distribution, which covers four labels: CNV, DME, DRUSEN, and NORMAL. The architecture can accept additional findings, but the UI and API must not claim support for macular hole, retinal detachment, vitreomacular traction, or other conditions until there's patient-level data and validation to back it up.
 OCT2017 doesn't give a reliable severity target, so DME severity is reported as UNKNOWN, and the fail-safe policy routes it to urgent review. Grad-CAM overlays show what influenced the network's activation. They're supporting visualizations, not causal explanations, and not proof that a finding is actually present.
 ## Architecture
