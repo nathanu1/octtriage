@@ -1,0 +1,9 @@
+schema_version: "1.0"
+minimum_width: 128
+minimum_height: 128
+minimum_dynamic_range: 18.0
+minimum_blur_variance: 12.0
+maximum_saturation_fraction: 0.35
+maximum_center_offset: 0.42
+foreground_percentile: 65.0
+minimum_volume_usable_fraction: 1.0
