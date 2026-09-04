@@ -1,0 +1,36 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      OCT_PROJECT_ROOT: /app
+      OCT_CHECKPOINT_PATH: /app/model_registry/checkpoints/best.pt
+      OCT_RUNTIME_DIR: /app/runtime
+      OCT_DATABASE_PATH: /app/runtime/audit.db
+      OCT_DICOM_HASH_SALT: ${OCT_DICOM_HASH_SALT:-replace-before-use}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./model_registry:/app/model_registry:ro
+      - oct_runtime:/app/runtime
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+    environment:
+      OCT_API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  oct_runtime:

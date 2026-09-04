@@ -1,0 +1,46 @@
+schema_version: "1.0"
+
+disclaimer: >-
+  Clinical decision-support prototype. This output is not a diagnosis and requires
+  review by a qualified clinician. Do not use this prototype for patient care.
+
+priority_order:
+  ROUTINE: 0
+  SEMI_URGENT: 1
+  URGENT: 2
+
+findings:
+  CNV:
+    display_name: Choroidal neovascularization pattern
+    default_tier: URGENT
+  DME:
+    display_name: Diabetic macular edema pattern
+    severity_tiers:
+      SEVERE: URGENT
+      MODERATE: SEMI_URGENT
+      MILD: SEMI_URGENT
+      UNKNOWN: URGENT
+  DRUSEN:
+    display_name: Drusen pattern
+    default_tier: ROUTINE
+  NORMAL:
+    display_name: No dataset-defined abnormality detected
+    default_tier: ROUTINE
+
+finding_probability_thresholds:
+  CNV: 0.25
+  DME: 0.25
+
+uncertainty:
+  minimum_confidence: 0.80
+  minimum_tta_agreement: 0.75
+  maximum_normalized_entropy: 0.60
+  escalation_tier: URGENT
+
+quality_failure:
+  tier: URGENT
+  finding: UNINTERPRETABLE_SCAN
+  require_repeat_acquisition: true
+
+combination_rule: HIGHEST_URGENCY_WINS
+allow_automatic_downgrade: false

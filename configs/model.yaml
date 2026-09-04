@@ -1,0 +1,14 @@
+schema_version: "1.0"
+classes: [CNV, DME, DRUSEN, NORMAL]
+urgent_classes: [CNV, DME]
+backbone: efficientnet_b0
+image_size: 224
+batch_size: 32
+epochs: 10
+learning_rate: 0.0001
+weight_decay: 0.0001
+seed: 42
+num_workers: 4
+pretrained_imagenet: true
+tta_horizontal_flip: true
+checkpoint_metric: urgent_recall
