@@ -1,31 +1,11 @@
-# Retinal OCT Triage Decision-Support System
+An end-to-end reference implementation for prioritizing retinal OCT (optical coherence tomography) studies for ophthalmologist review. It takes exported B-scan images and DICOM pixel data, runs them through a scan-quality gate, applies a transfer-learned classifier with test-time augmentation, maps the evidence to an editable urgency policy, and logs both predictions and human overrides for audit.
+# Built by Nathan Lee Yang.
 
-An end-to-end reference implementation for prioritizing retinal optical coherence tomography
-(OCT) studies for ophthalmologist review. It supports exported B-scan images and DICOM pixel
-data, applies a scan-quality gate, runs a transfer-learned classifier with test-time
-augmentation, maps evidence to an editable urgency policy, and records predictions and human
-overrides in an audit log.
+Decision support only. This is an educational and research prototype, not an autonomous diagnostic system. It is not FDA-cleared or CE-marked and must not be used for patient care. Clinical deployment would need device-appropriate regulatory clearance, privacy and security controls, representative multi-site validation, and prospective clinical validation under qualified ophthalmology leadership.
 
-Built by **Nathan Lee Yang**.
-
-> **Decision support only.** This repository is an educational and research prototype. It is not
-> an autonomous diagnostic system, is not FDA-cleared or CE-marked, and must not be used for
-> patient care. Clinical deployment would require device-appropriate regulatory clearance,
-> privacy/security controls, representative multi-site validation, and prospective clinical
-> validation under qualified ophthalmology leadership.
-
-## What the current model can and cannot detect
-
-The prototype training path uses the Kermany OCT2017 Kaggle distribution with four image labels:
-`CNV`, `DME`, `DRUSEN`, and `NORMAL`. The architecture can accept additional findings, but the UI
-and API must not claim support for macular hole, retinal detachment, vitreomacular traction, or
-other conditions until appropriate patient-level data and validation are added.
-
-OCT2017 does not provide a reliable severity target. Consequently, DME severity is reported as
-`UNKNOWN`, and the approved fail-safe policy routes it to urgent review. Grad-CAM overlays show
-areas that influenced the network activation; they are supporting visualizations, not causal
-explanations and not proof that a finding is present.
-
+# What the current model can and cannot detect
+The prototype trains on the Kermany OCT2017 Kaggle distribution, which covers four labels: CNV, DME, DRUSEN, and NORMAL. The architecture can accept additional findings, but the UI and API must not claim support for macular hole, retinal detachment, vitreomacular traction, or other conditions until there's patient-level data and validation to back it up.
+OCT2017 doesn't give a reliable severity target, so DME severity is reported as UNKNOWN, and the fail-safe policy routes it to urgent review. Grad-CAM overlays show what influenced the network's activation. They're supporting visualizations, not causal explanations, and not proof that a finding is actually present.
 ## Architecture
 
 ```mermaid
