@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageSequence
 
 
 class UnsupportedScanError(ValueError):
@@ -77,13 +77,37 @@ def load_dicom_bytes(payload: bytes, patient_hash_salt: str) -> LoadedScan:
     return LoadedScan(frames=frames, source_type="dicom", patient_hash=patient_hash)
 
 
+# Pillow clips rather than rescales these modes when converting to 8-bit RGB.
+HIGH_BIT_DEPTH_MODES = {"I", "I;16", "I;16B", "I;16L", "I;16N", "F"}
+
+
+def _page_to_rgb(page: Image.Image) -> Image.Image:
+    if page.mode in HIGH_BIT_DEPTH_MODES:
+        return _array_to_frames(np.asarray(page))[0]
+    return page.convert("RGB")
+
+
 def load_image_bytes(payload: bytes) -> LoadedScan:
     try:
-        image = Image.open(io.BytesIO(payload)).convert("RGB")
-        image.load()
+        image = Image.open(io.BytesIO(payload))
+        # Multi-page TIFF exports carry a whole volume; triaging only the first B-scan would
+        # silently ignore the rest.
+        frames = [_page_to_rgb(page) for page in ImageSequence.Iterator(image)]
+    except UnsupportedScanError:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise UnsupportedScanError(f"Unable to decode image: {exc}") from exc
-    return LoadedScan(frames=[image], source_type="image")
+    if not frames:
+        raise UnsupportedScanError("Image contains no frames")
+    return LoadedScan(frames=frames, source_type="image")
+
+
+def read_bscan(path: str | Path) -> Image.Image:
+    """Decode one B-scan file exactly as the serving path does, for training and evaluation."""
+    frames = load_image_bytes(Path(path).read_bytes()).frames
+    if len(frames) != 1:
+        raise UnsupportedScanError(f"Expected a single B-scan in {path}, found {len(frames)}")
+    return frames[0]
 
 
 def load_scan_bytes(payload: bytes, filename: str, patient_hash_salt: str) -> LoadedScan:
