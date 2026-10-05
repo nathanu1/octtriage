@@ -2,6 +2,7 @@
 .env
 .venv/
 __pycache__/
+*.egg-info/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
@@ -20,3 +21,4 @@ runtime/*
 !runtime/.gitkeep
 reports/figures/*.png
 reports/metrics/*.json
+reports/metrics/*.png

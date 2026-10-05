@@ -21,4 +21,7 @@ This file is a **placeholder** for structured error analysis after you have a tr
 - If you show results publicly, pair metrics with **limitations** and a clear **non-clinical** scope.
 
 After training, link the immutable model version, manifest hash, figures, and metric JSON used for
-the review. Do not replace an earlier run's notes without preserving its model version.
+the review; the `provenance` section of `test_metrics.json` records the model version and the
+checkpoint, manifest, and rule-file hashes. Start the safety-error review from the
+`triage_policy` section, which counts urgent cases that the full policy left below `URGENT`.
+Do not replace an earlier run's notes without preserving its model version.

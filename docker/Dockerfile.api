@@ -6,6 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OCT_DATABASE_PATH=/app/runtime/audit.db
 
 WORKDIR /app
+# CPU wheels keep the image small; install a CUDA build instead when serving on a GPU host.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 COPY pyproject.toml README.md ./
 COPY configs ./configs
 COPY src ./src
