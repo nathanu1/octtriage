@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import pytest
@@ -109,3 +110,64 @@ def test_rules_refuse_automatic_downgrade() -> None:
     unsafe["allow_automatic_downgrade"] = True
     with pytest.raises(ValueError, match="allow_automatic_downgrade"):
         TriageEngine(unsafe)
+
+
+def test_driving_finding_is_listed_first() -> None:
+    result = decide(
+        TriageEngine(RULES),
+        "NORMAL",
+        0.82,
+        {"CNV": 0.27, "DME": 0.02, "DRUSEN": 0.03, "NORMAL": 0.82},
+    )
+    assert result.findings == ["CNV", "NORMAL"]
+
+
+def _rules_with(mutate) -> dict:
+    rules = copy.deepcopy(TriageEngine(RULES).rules)
+    mutate(rules)
+    return rules
+
+
+def test_rules_refuse_inverted_priority_order() -> None:
+    def invert(rules: dict) -> None:
+        rules["priority_order"] = {"ROUTINE": 5, "SEMI_URGENT": 1, "URGENT": 2}
+
+    with pytest.raises(ValueError, match="ROUTINE < SEMI_URGENT < URGENT"):
+        TriageEngine(_rules_with(invert))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda rules: rules["findings"]["CNV"].update(default_tier="URGNET"),
+        lambda rules: rules["findings"]["DME"]["severity_tiers"].update(MILD="SOON"),
+        lambda rules: rules["uncertainty"].update(escalation_tier="HIGH"),
+        lambda rules: rules["quality_failure"].update(tier="STAT"),
+    ],
+)
+def test_rules_refuse_unknown_tier_names(mutate) -> None:
+    with pytest.raises(ValueError, match="Unknown triage tier"):
+        TriageEngine(_rules_with(mutate))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda rules: rules["uncertainty"].update(minimum_confidence=80),
+        lambda rules: rules["uncertainty"].pop("minimum_tta_agreement"),
+        lambda rules: rules["finding_probability_thresholds"].update(CNV=-0.1),
+    ],
+)
+def test_rules_refuse_out_of_range_thresholds(mutate) -> None:
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        TriageEngine(_rules_with(mutate))
+
+
+def test_unknown_model_class_routes_to_urgent() -> None:
+    result = decide(
+        TriageEngine(RULES),
+        "MACULAR_HOLE",
+        0.97,
+        {"MACULAR_HOLE": 0.97, "NORMAL": 0.03},
+    )
+    assert result.triage_tier == "URGENT"
