@@ -19,6 +19,50 @@ def api_get(path: str):
     return response.json()
 
 
+@st.cache_data(show_spinner=False, max_entries=256)
+def fetch_media(path: str) -> bytes:
+    # Fetch server-side: the browser cannot resolve internal API hosts such as http://api:8000.
+    response = requests.get(f"{API_URL}{path}", timeout=20)
+    response.raise_for_status()
+    return response.content
+
+
+def show_media(column, path: str | None, caption: str, **kwargs) -> None:
+    if not path:
+        return
+    try:
+        column.image(fetch_media(path), caption=caption, **kwargs)
+    except requests.RequestException as exc:
+        column.warning(f"{caption} is unavailable: {exc}")
+
+
+def saliency_caption(saliency_class: str | None) -> str:
+    target = f" for {saliency_class}" if saliency_class else ""
+    return f"Grad-CAM attention overlay{target} (supporting evidence, not an explanation)"
+
+
+def render_evidence(result: dict) -> None:
+    confidence = result.get("confidence")
+    st.metric("Model confidence", "Not available" if confidence is None else f"{confidence:.1%}")
+    st.write("Findings driving priority:", ", ".join(result["findings"]))
+    if result.get("escalation_reasons"):
+        st.warning("Escalated because: " + ", ".join(result["escalation_reasons"]))
+    if result.get("requires_repeat_acquisition"):
+        st.warning("The quality gate recommends repeat acquisition and immediate human review.")
+    if result.get("class_probabilities"):
+        st.caption(
+            "Aggregated class evidence (max across views for pathology, min for NORMAL; "
+            "not calibrated probabilities)"
+        )
+        st.dataframe(
+            pd.DataFrame(
+                sorted(result["class_probabilities"].items(), key=lambda item: -item[1]),
+                columns=["class", "evidence"],
+            ),
+            hide_index=True,
+        )
+
+
 def submit_scan(uploaded, study_id: str):
     files = {
         "file": (
@@ -44,20 +88,12 @@ def tier_badge(tier: str) -> None:
 
 def render_result(result: dict) -> None:
     tier_badge(result["triage_tier"])
-    confidence = result.get("confidence")
-    st.metric("Model confidence", "Not available" if confidence is None else f"{confidence:.1%}")
-    st.write("Findings driving priority:", ", ".join(result["findings"]))
-    if result.get("escalation_reasons"):
-        st.warning("Escalated because: " + ", ".join(result["escalation_reasons"]))
-    if result.get("requires_repeat_acquisition"):
-        st.warning("The quality gate recommends repeat acquisition and immediate human review.")
+    render_evidence(result)
     columns = st.columns(2)
-    columns[0].image(f"{API_URL}{result['thumbnail_url']}", caption="Submitted scan")
-    if result.get("saliency_map_url"):
-        columns[1].image(
-            f"{API_URL}{result['saliency_map_url']}",
-            caption="Grad-CAM attention overlay (supporting evidence, not an explanation)",
-        )
+    show_media(columns[0], result["thumbnail_url"], "Submitted scan")
+    show_media(
+        columns[1], result.get("saliency_map_url"), saliency_caption(result.get("saliency_class"))
+    )
     st.caption(f"Model: {result['model_version']} · Audit ID: {result['audit_id']}")
     st.error(result["disclaimer"])
 
@@ -94,13 +130,34 @@ def render_worklist() -> None:
         options=items,
         format_func=lambda item: f"{item['effective_tier']} · {item['study_id']}",
     )
-    st.image(f"{API_URL}/v1/media/{selected['thumbnail_path'].split('/')[-1]}", width=420)
-    if selected.get("saliency_path"):
-        st.image(
-            f"{API_URL}/v1/media/{selected['saliency_path'].split('/')[-1]}",
-            width=420,
-            caption="Grad-CAM attention overlay",
+    try:
+        detail = api_get(f"/v1/predictions/{selected['audit_id']}")
+    except requests.RequestException as exc:
+        st.error(f"The audit record could not be loaded: {exc}")
+        return
+    prediction = detail["prediction"]
+    tier_badge(detail["effective_tier"])
+    if detail["effective_tier"] != prediction["triage_tier"]:
+        st.caption(f"Model tier was {prediction['triage_tier']}; changed by clinician override.")
+    columns = st.columns(2)
+    show_media(columns[0], selected["thumbnail_url"], "Submitted scan", width=420)
+    show_media(
+        columns[1],
+        selected.get("saliency_map_url"),
+        saliency_caption(prediction.get("saliency_class")),
+        width=420,
+    )
+    render_evidence(prediction)
+    if detail["overrides"]:
+        st.markdown("#### Override history")
+        st.dataframe(
+            pd.DataFrame(detail["overrides"])[
+                ["timestamp", "original_tier", "new_tier", "clinician_id", "reason"]
+            ],
+            hide_index=True,
+            use_container_width=True,
         )
+    st.caption(f"Model: {prediction['model_version']} · Audit ID: {prediction['audit_id']}")
 
     with st.form("clinician_override"):
         st.markdown("#### Clinician override")

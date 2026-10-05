@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 def utc_now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 class AuditStore:
@@ -18,10 +20,13 @@ class AuditStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path)
-        connection.row_factory = sqlite3.Row
-        return connection
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # sqlite3's own context manager commits but never closes; close every connection.
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.row_factory = sqlite3.Row
+            with connection:
+                yield connection
 
     def initialize(self) -> None:
         with self._connect() as connection:
@@ -110,6 +115,27 @@ class AuditStore:
             item["effective_tier"] = item["override_tier"] or item["triage_tier"]
             worklist.append(item)
         return worklist
+
+    def get_prediction(self, audit_id: str) -> dict[str, Any]:
+        """Return the original model response with its full, ordered override history."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT response_json FROM predictions WHERE audit_id = ?", (audit_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(audit_id)
+            overrides = connection.execute(
+                "SELECT override_id, audit_id, original_tier, new_tier, clinician_id, reason, "
+                "created_at AS timestamp FROM overrides WHERE audit_id = ? ORDER BY created_at",
+                (audit_id,),
+            ).fetchall()
+        prediction = json.loads(row["response_json"])
+        history = [dict(override) for override in overrides]
+        return {
+            "prediction": prediction,
+            "overrides": history,
+            "effective_tier": history[-1]["new_tier"] if history else prediction["triage_tier"],
+        }
 
     def record_override(
         self,

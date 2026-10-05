@@ -21,6 +21,7 @@ class TriageResponse(BaseModel):
     findings: list[str]
     class_probabilities: dict[str, float]
     saliency_map_url: str | None
+    saliency_class: str | None = None
     thumbnail_url: str
     model_version: str
     timestamp: str
@@ -46,3 +47,9 @@ class OverrideResponse(BaseModel):
     clinician_id: str
     reason: str
     timestamp: str
+
+
+class PredictionDetailResponse(BaseModel):
+    prediction: TriageResponse
+    overrides: list[OverrideResponse]
+    effective_tier: Tier

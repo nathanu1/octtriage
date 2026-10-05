@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +12,15 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 
-from api.schemas import OverrideRequest, OverrideResponse, TriageResponse
+from api.schemas import (
+    OverrideRequest,
+    OverrideResponse,
+    PredictionDetailResponse,
+    TriageResponse,
+)
 from octtriage.data.io import UnsupportedScanError
 from octtriage.serving.audit import AuditStore
+from octtriage.serving.errors import ModelUnavailableError
 from octtriage.settings import Settings, settings
 
 logger = logging.getLogger("octtriage.audit")
@@ -23,16 +30,13 @@ API_DISCLAIMER = (
 )
 
 
-class ModelUnavailableError(RuntimeError):
-    pass
-
-
 class LazyPredictor:
     """Keep API health and contract endpoints usable before heavyweight ML imports."""
 
     def __init__(self, app_settings: Settings) -> None:
         self.settings = app_settings
         self._service = None
+        self._lock = threading.Lock()
 
     @property
     def ready(self) -> bool:
@@ -43,15 +47,20 @@ class LazyPredictor:
             raise ModelUnavailableError(
                 "No trained checkpoint is registered. Train the Kaggle baseline before inference."
             )
-        if self._service is None:
-            from octtriage.serving.inference import ModelInferenceService
+        with self._lock:
+            if self._service is None:
+                from octtriage.serving.inference import ModelInferenceService
 
-            self._service = ModelInferenceService(self.settings)
+                self._service = ModelInferenceService(self.settings)
         return self._service.predict(payload, filename)
 
 
 def _dump(model: Any) -> dict[str, Any]:
     return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
+def _media_url(path: str | None) -> str | None:
+    return f"/v1/media/{Path(path).name}" if path else None
 
 
 def create_app(
@@ -102,12 +111,14 @@ def create_app(
             "disclaimer": API_DISCLAIMER,
         }
 
+    # A plain ``def`` endpoint runs in FastAPI's thread pool, so model inference does not block
+    # the event loop (and with it /health checks) while a scan is processed.
     @app.post("/v1/triage", response_model=TriageResponse)
-    async def triage_scan(
+    def triage_scan(
         file: UploadFile = File(...),
         study_id: str | None = Form(default=None),
     ) -> TriageResponse:
-        payload = await file.read(app_settings.max_upload_bytes + 1)
+        payload = file.file.read(app_settings.max_upload_bytes + 1)
         if not payload:
             raise HTTPException(status_code=422, detail="Uploaded scan is empty")
         if len(payload) > app_settings.max_upload_bytes:
@@ -121,7 +132,7 @@ def create_app(
 
         audit_id = str(uuid.uuid4())
         resolved_study_id = study_id.strip() if study_id and study_id.strip() else audit_id
-        timestamp = datetime.now(UTC).isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         media_dir = Path(app_settings.media_dir)
         media_dir.mkdir(parents=True, exist_ok=True)
         thumbnail_path = media_dir / f"{audit_id}-thumbnail.png"
@@ -138,6 +149,7 @@ def create_app(
             findings=result.findings,
             class_probabilities=result.class_probabilities,
             saliency_map_url=f"/v1/media/{saliency_path.name}" if saliency_path else None,
+            saliency_class=result.saliency_class,
             thumbnail_url=f"/v1/media/{thumbnail_path.name}",
             model_version=result.model_version,
             timestamp=timestamp,
@@ -171,10 +183,25 @@ def create_app(
 
     @app.get("/v1/worklist")
     def worklist(limit: int = 100) -> dict[str, object]:
+        items = app.state.audit.list_worklist(min(max(limit, 1), 500))
+        for item in items:
+            # Expose media URLs; server filesystem paths stay internal to the audit store.
+            item["thumbnail_url"] = _media_url(item.pop("thumbnail_path"))
+            item["saliency_map_url"] = _media_url(item.pop("saliency_path"))
         return {
-            "items": app.state.audit.list_worklist(min(max(limit, 1), 500)),
+            "items": items,
             "disclaimer": "Decision support only; every item requires clinician review.",
         }
+
+    @app.get("/v1/predictions/{audit_id}", response_model=PredictionDetailResponse)
+    def prediction_detail(audit_id: str) -> PredictionDetailResponse:
+        try:
+            record = app.state.audit.get_prediction(audit_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail="Prediction audit record not found"
+            ) from exc
+        return PredictionDetailResponse(**record)
 
     @app.get("/v1/media/{filename}")
     def media(filename: str) -> FileResponse:
