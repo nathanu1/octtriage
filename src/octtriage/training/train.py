@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -99,7 +99,7 @@ def train(manifest_path: Path, output_path: Path, config_path: Path, device_name
         weight_decay=float(config["weight_decay"]),
     )
     urgent_indices = {classes.index(label) for label in config["urgent_classes"]}
-    version = f"octtriage-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+    version = f"octtriage-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     best_score = -1.0
     best_loss = float("inf")
     best_metrics: dict[str, float] = {}
