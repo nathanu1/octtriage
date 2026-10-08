@@ -5,10 +5,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OCT_API_URL=http://api:8000
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
-COPY src ./src
+# The worklist only talks to the API over HTTP, so it does not need the ML stack.
+COPY ui/requirements.txt ./ui/requirements.txt
+RUN pip install --no-cache-dir -r ui/requirements.txt
 COPY ui ./ui
-RUN pip install --no-cache-dir .
 
 EXPOSE 8501
 CMD ["streamlit", "run", "ui/app.py", "--server.address=0.0.0.0"]

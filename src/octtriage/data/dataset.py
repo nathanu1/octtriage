@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
-from PIL import Image
 from torch.utils.data import Dataset
+
+from octtriage.data.io import read_bscan
 
 
 class OCTManifestDataset(Dataset):
@@ -31,6 +32,6 @@ class OCTManifestDataset(Dataset):
 
     def __getitem__(self, index: int):
         row = self.frame.iloc[index]
-        image = Image.open(row["path"]).convert("RGB")
+        image = read_bscan(row["path"])
         tensor = self.transform(image)
         return tensor, self.class_to_idx[row["label"]]

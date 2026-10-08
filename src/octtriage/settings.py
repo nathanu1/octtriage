@@ -33,6 +33,9 @@ class Settings:
     )
     dicom_hash_salt: str = os.getenv("OCT_DICOM_HASH_SALT", "prototype-only-change-me")
     max_upload_bytes: int = int(os.getenv("OCT_MAX_UPLOAD_BYTES", str(64 * 1024 * 1024)))
+    # Compressed uploads can expand enormously; bound what a single scan may decode to.
+    max_scan_frames: int = int(os.getenv("OCT_MAX_SCAN_FRAMES", "512"))
+    max_scan_pixels: int = int(os.getenv("OCT_MAX_SCAN_PIXELS", str(256_000_000)))
 
     @property
     def media_dir(self) -> Path:

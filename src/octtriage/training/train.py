@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +17,8 @@ from octtriage.config import load_yaml
 from octtriage.data.dataset import OCTManifestDataset
 from octtriage.data.manifest import assert_no_patient_leakage
 from octtriage.data.transforms import inference_transform, training_transform
+from octtriage.evaluation.calibration import MAXIMUM_TEMPERATURE, fit_temperature, softmax
+from octtriage.evaluation.metrics import expected_calibration_error
 from octtriage.models.classifier import build_classifier
 from octtriage.models.registry import register_model
 from octtriage.settings import settings
@@ -67,6 +69,34 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None) -> tuple[float, li
     return total_loss / max(len(loader.dataset), 1), y_true, y_pred
 
 
+@torch.inference_mode()
+def collect_logits(model, loader, device) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    logits: list[np.ndarray] = []
+    targets: list[int] = []
+    for inputs, batch_targets in loader:
+        logits.append(model(inputs.to(device)).cpu().numpy())
+        targets.extend(batch_targets.tolist())
+    return np.concatenate(logits), np.asarray(targets)
+
+
+def calibrate_checkpoint(model, checkpoint_path: Path, val_loader, device) -> dict[str, float]:
+    """Fit a softmax temperature for the selected checkpoint on the validation split."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    logits, targets = collect_logits(model, val_loader, device)
+    temperature = fit_temperature(logits, targets)
+    calibration = {
+        "temperature": temperature,
+        "validation_ece_uncalibrated": expected_calibration_error(targets, softmax(logits)),
+        "validation_ece": expected_calibration_error(targets, softmax(logits, temperature)),
+    }
+    checkpoint["temperature"] = temperature
+    checkpoint["validation_metrics"] = {**checkpoint["validation_metrics"], **calibration}
+    torch.save(checkpoint, checkpoint_path)
+    return calibration
+
+
 def train(manifest_path: Path, output_path: Path, config_path: Path, device_name: str) -> Path:
     config = load_yaml(config_path)
     seed_everything(int(config["seed"]))
@@ -99,7 +129,7 @@ def train(manifest_path: Path, output_path: Path, config_path: Path, device_name
         weight_decay=float(config["weight_decay"]),
     )
     urgent_indices = {classes.index(label) for label in config["urgent_classes"]}
-    version = f"octtriage-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+    version = f"octtriage-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     best_score = -1.0
     best_loss = float("inf")
     best_metrics: dict[str, float] = {}
@@ -132,6 +162,19 @@ def train(manifest_path: Path, output_path: Path, config_path: Path, device_name
                     "validation_metrics": best_metrics,
                 },
                 output_path,
+            )
+    if bool(config.get("calibrate_temperature", True)):
+        calibration = calibrate_checkpoint(model, output_path, val_loader, device)
+        best_metrics.update(calibration)
+        print(
+            f"temperature={calibration['temperature']:.3f} "
+            f"val_ece={calibration['validation_ece_uncalibrated']:.4f}"
+            f"->{calibration['validation_ece']:.4f}"
+        )
+        if calibration["temperature"] >= MAXIMUM_TEMPERATURE:
+            print(
+                "warning: the fitted temperature reached its upper bound; validation predictions "
+                "are close to uninformative, so most cases will be escalated."
             )
     register_model(
         settings.model_registry_path,

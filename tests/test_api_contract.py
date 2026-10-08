@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import io
+import json
+import logging
+import threading
 from types import SimpleNamespace
 
+import httpx
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from api.main import create_app
+from api.main import LazyPredictor, create_app
+from octtriage.data.io import ScanTooLargeError
 from octtriage.serving.audit import AuditStore
+from octtriage.serving.errors import ModelUnavailableError
 from octtriage.settings import Settings
 
 
@@ -29,28 +36,40 @@ class FakePredictor:
             model_version="test-model-v1",
             request_sha256="a" * 64,
             saliency_png=buffer.getvalue(),
+            saliency_class="CNV",
             thumbnail_png=buffer.getvalue(),
             disclaimer="Clinical decision-support prototype. This output is not a diagnosis.",
         )
 
 
-def test_api_contract_and_override_are_audited(tmp_path) -> None:
-    app_settings = Settings(
+def settings_for(tmp_path, **overrides) -> Settings:
+    return Settings(
         project_root=tmp_path,
         runtime_dir=tmp_path / "runtime",
         database_path=tmp_path / "runtime" / "audit.db",
         checkpoint_path=tmp_path / "best.pt",
+        **overrides,
     )
+
+
+def client_for(tmp_path, predictor=None, **overrides) -> TestClient:
+    app_settings = settings_for(tmp_path, **overrides)
     store = AuditStore(app_settings.database_path)
-    client = TestClient(create_app(FakePredictor(), store, app_settings))
+    return TestClient(create_app(predictor or FakePredictor(), store, app_settings))
+
+
+def submit(client: TestClient, payload: bytes = b"valid-test-payload", **data):
+    return client.post(
+        "/v1/triage", data=data, files={"file": ("scan.png", payload, "image/png")}
+    )
+
+
+def test_api_contract_and_override_are_audited(tmp_path) -> None:
+    client = client_for(tmp_path)
     health = client.get("/health").json()
     assert health["model_ready"] is True
     assert "not a diagnosis" in health["disclaimer"]
-    response = client.post(
-        "/v1/triage",
-        data={"study_id": "DEID-001"},
-        files={"file": ("scan.png", b"valid-test-payload", "image/png")},
-    )
+    response = submit(client, study_id="DEID-001")
     assert response.status_code == 200
     body = response.json()
     assert body["triage_tier"] == "URGENT"
@@ -58,6 +77,7 @@ def test_api_contract_and_override_are_audited(tmp_path) -> None:
     assert "not a diagnosis" in body["disclaimer"]
     assert body["model_version"] == "test-model-v1"
     assert body["saliency_map_url"]
+    assert body["saliency_class"] == "CNV"
 
     worklist = client.get("/v1/worklist").json()["items"]
     assert len(worklist) == 1
@@ -77,17 +97,264 @@ def test_api_contract_and_override_are_audited(tmp_path) -> None:
     assert client.get("/v1/worklist").json()["items"][0]["effective_tier"] == "SEMI_URGENT"
 
 
+def test_worklist_exposes_media_urls_not_server_paths(tmp_path) -> None:
+    client = client_for(tmp_path)
+    body = submit(client).json()
+    item = client.get("/v1/worklist").json()["items"][0]
+    assert "thumbnail_path" not in item
+    assert "saliency_path" not in item
+    assert item["thumbnail_url"] == body["thumbnail_url"]
+    assert item["saliency_map_url"] == body["saliency_map_url"]
+    assert client.get(item["thumbnail_url"]).headers["content-type"] == "image/png"
+
+
+def test_prediction_detail_keeps_original_decision_and_override_history(tmp_path) -> None:
+    client = client_for(tmp_path)
+    audit_id = submit(client).json()["audit_id"]
+    for tier in ["SEMI_URGENT", "ROUTINE"]:
+        client.post(
+            "/v1/overrides",
+            json={
+                "audit_id": audit_id,
+                "new_tier": tier,
+                "clinician_id": "clinician-test",
+                "reason": f"Reviewed; reprioritized to {tier}.",
+            },
+        )
+    detail = client.get(f"/v1/predictions/{audit_id}").json()
+    assert detail["prediction"]["triage_tier"] == "URGENT"
+    assert detail["effective_tier"] == "ROUTINE"
+    assert [item["original_tier"] for item in detail["overrides"]] == ["URGENT", "SEMI_URGENT"]
+    assert [item["new_tier"] for item in detail["overrides"]] == ["SEMI_URGENT", "ROUTINE"]
+    assert client.get("/v1/predictions/unknown").status_code == 404
+
+
 def test_empty_upload_is_rejected(tmp_path) -> None:
-    app_settings = Settings(
-        project_root=tmp_path,
-        runtime_dir=tmp_path / "runtime",
-        database_path=tmp_path / "runtime" / "audit.db",
-        checkpoint_path=tmp_path / "best.pt",
-    )
-    client = TestClient(
-        create_app(FakePredictor(), AuditStore(app_settings.database_path), app_settings)
-    )
-    response = client.post("/v1/triage", files={"file": ("scan.png", b"", "image/png")})
+    response = submit(client_for(tmp_path), payload=b"")
     assert response.status_code == 422
     assert response.json()["decision_support_only"] is True
     assert "not a diagnosis" in response.json()["disclaimer"]
+
+
+def test_oversized_upload_is_rejected(tmp_path) -> None:
+    response = submit(client_for(tmp_path, max_upload_bytes=8), payload=b"x" * 9)
+    assert response.status_code == 413
+
+
+def test_missing_model_returns_503_and_records_nothing(tmp_path) -> None:
+    app_settings = settings_for(tmp_path)
+    store = AuditStore(app_settings.database_path)
+    client = TestClient(create_app(LazyPredictor(app_settings), store, app_settings))
+    assert client.get("/health").json()["model_ready"] is False
+    response = submit(client)
+    assert response.status_code == 503
+    assert response.json()["decision_support_only"] is True
+    assert store.list_worklist() == []
+
+
+def test_model_load_failure_returns_503(tmp_path) -> None:
+    class BrokenPredictor:
+        ready = True
+
+        def predict(self, payload: bytes, filename: str):
+            raise ModelUnavailableError("Model checkpoint could not be loaded: corrupt")
+
+    response = submit(client_for(tmp_path, predictor=BrokenPredictor()))
+    assert response.status_code == 503
+    assert "could not be loaded" in response.json()["detail"]
+
+
+def test_health_stays_responsive_while_inference_runs(tmp_path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingPredictor(FakePredictor):
+        def predict(self, payload: bytes, filename: str):
+            started.set()
+            release.wait(timeout=5)
+            finished.set()
+            return super().predict(payload, filename)
+
+    app_settings = settings_for(tmp_path)
+    app = create_app(BlockingPredictor(), AuditStore(app_settings.database_path), app_settings)
+
+    async def exercise() -> tuple[int, bool, int]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            triage = asyncio.create_task(
+                client.post("/v1/triage", files={"file": ("scan.png", b"x", "image/png")})
+            )
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            health = await client.get("/health")
+            answered_during_inference = not finished.is_set()
+            release.set()
+            return health.status_code, answered_during_inference, (await triage).status_code
+
+    assert asyncio.run(exercise()) == (200, True, 200)
+
+
+def test_body_with_oversized_content_length_is_rejected_before_parsing(tmp_path) -> None:
+    response = submit(client_for(tmp_path, max_upload_bytes=8), payload=b"x" * (2 * 1024 * 1024))
+    assert response.status_code == 413
+    assert response.json()["decision_support_only"] is True
+
+
+def test_oversized_body_without_content_length_is_rejected(tmp_path) -> None:
+    app_settings = settings_for(tmp_path, max_upload_bytes=8)
+    app = create_app(FakePredictor(), AuditStore(app_settings.database_path), app_settings)
+    header = (
+        b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; "
+        b"filename=\"scan.png\"\r\nContent-Type: image/png\r\n\r\n"
+    )
+    chunks = [header, *([b"x" * (1024 * 1024)] * 4), b"\r\n--boundary--\r\n"]
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        body = chunks.pop(0) if chunks else b""
+        return {"type": "http.request", "body": body, "more_body": bool(chunks)}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/triage",
+        "raw_path": b"/v1/triage",
+        "query_string": b"",
+        "root_path": "",
+        # Chunked transfer: no Content-Length, so only the streaming guard can catch it.
+        "headers": [(b"content-type", b"multipart/form-data; boundary=boundary")],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    asyncio.run(app(scope, receive, send))
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 413
+    assert chunks, "the guard should stop reading before the whole body arrives"
+
+
+def test_scan_that_decodes_too_large_returns_413(tmp_path) -> None:
+    class HugeScanPredictor(FakePredictor):
+        def predict(self, payload: bytes, filename: str):
+            raise ScanTooLargeError("Scan has 4000 frames; the limit is 512")
+
+    response = submit(client_for(tmp_path, predictor=HugeScanPredictor()))
+    assert response.status_code == 413
+    assert "4000 frames" in response.json()["detail"]
+
+
+def test_predictions_and_overrides_emit_structured_audit_events(tmp_path) -> None:
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    audit_logger = logging.getLogger("octtriage.audit")
+    audit_logger.addHandler(handler)
+    try:
+        client = client_for(tmp_path)
+        audit_id = submit(client).json()["audit_id"]
+        client.post(
+            "/v1/overrides",
+            json={
+                "audit_id": audit_id,
+                "new_tier": "ROUTINE",
+                "clinician_id": "clinician-test",
+                "reason": "Reviewed the source scan.",
+            },
+        )
+    finally:
+        audit_logger.removeHandler(handler)
+    events = [json.loads(record.getMessage()) for record in records]
+    assert [event["event"] for event in events] == [
+        "prediction_recorded",
+        "clinician_override_recorded",
+    ]
+    assert all(event["audit_id"] == audit_id for event in events)
+
+
+def sign_off(client: TestClient, audit_id: str, final_tier: str, note: str = ""):
+    return client.post(
+        "/v1/reviews",
+        json={
+            "audit_id": audit_id,
+            "final_tier": final_tier,
+            "clinician_id": "clinician-test",
+            "note": note,
+        },
+    )
+
+
+def worklist_ids(client: TestClient, status: str) -> list[str]:
+    items = client.get("/v1/worklist", params={"status": status}).json()["items"]
+    return [item["audit_id"] for item in items]
+
+
+def test_agreeing_sign_off_moves_study_out_of_the_pending_queue(tmp_path) -> None:
+    client = client_for(tmp_path)
+    audit_id = submit(client).json()["audit_id"]
+    assert worklist_ids(client, "pending") == [audit_id]
+
+    review = sign_off(client, audit_id, "URGENT")
+    assert review.status_code == 200
+    assert review.json()["prior_tier"] == "URGENT"
+    assert review.json()["override_id"] is None
+
+    assert worklist_ids(client, "pending") == []
+    assert worklist_ids(client, "reviewed") == [audit_id]
+    assert worklist_ids(client, "all") == [audit_id]
+    reviewed = client.get("/v1/worklist", params={"status": "reviewed"}).json()["items"][0]
+    assert reviewed["reviewed_by"] == "clinician-test"
+    detail = client.get(f"/v1/predictions/{audit_id}").json()
+    assert detail["review_status"] == "reviewed"
+    assert detail["overrides"] == []
+    assert len(detail["reviews"]) == 1
+
+
+def test_sign_off_that_changes_the_tier_requires_a_reason_and_records_an_override(
+    tmp_path,
+) -> None:
+    client = client_for(tmp_path)
+    audit_id = submit(client).json()["audit_id"]
+    assert sign_off(client, audit_id, "ROUTINE").status_code == 422
+    assert client.get(f"/v1/predictions/{audit_id}").json()["reviews"] == []
+
+    review = sign_off(client, audit_id, "ROUTINE", note="Prior imaging shows stable drusen.")
+    assert review.status_code == 200
+    detail = client.get(f"/v1/predictions/{audit_id}").json()
+    assert detail["prediction"]["triage_tier"] == "URGENT"
+    assert detail["effective_tier"] == "ROUTINE"
+    assert detail["review_status"] == "reviewed"
+    [override] = detail["overrides"]
+    assert override["override_id"] == review.json()["override_id"]
+    assert override["reason"] == "Prior imaging shows stable drusen."
+    assert override["original_tier"] == "URGENT"
+
+
+def test_override_after_sign_off_returns_study_to_pending(tmp_path) -> None:
+    client = client_for(tmp_path)
+    audit_id = submit(client).json()["audit_id"]
+    sign_off(client, audit_id, "URGENT")
+    client.post(
+        "/v1/overrides",
+        json={
+            "audit_id": audit_id,
+            "new_tier": "SEMI_URGENT",
+            "clinician_id": "second-reader",
+            "reason": "Second read disagrees.",
+        },
+    )
+    assert worklist_ids(client, "pending") == [audit_id]
+    assert client.get(f"/v1/predictions/{audit_id}").json()["review_status"] == "pending"
+    pending = client.get("/v1/worklist").json()["items"][0]
+    assert pending["reviewed_at"] is None
+
+
+def test_review_validation_errors(tmp_path) -> None:
+    client = client_for(tmp_path)
+    assert sign_off(client, "unknown", "URGENT").status_code == 404
+    assert client.get("/v1/worklist", params={"status": "done"}).status_code == 422

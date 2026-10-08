@@ -38,7 +38,7 @@ code contains urgency tiers. The engine validates that `HIGHEST_URGENCY_WINS` an
 | `src/octtriage/evaluation/` | Sensitivity, specificity, AUROC, urgent recall, confusion/calibration plots |
 | `src/octtriage/triage/` | Deterministic fail-safe tier mapping |
 | `api/` | Versioned REST endpoints and media delivery |
-| `ui/` | Streamlit worklist, evidence viewer, and override workflow |
+| `ui/` | Streamlit worklist, evidence viewer, and clinician sign-off workflow |
 | `tests/` | Patient-leakage, quality, rules, audit, and API-contract tests |
 | `model_registry/` | Model metadata; large checkpoints are ignored |
 | `docker/` | API and UI container definitions |
@@ -83,13 +83,42 @@ oct-evaluate --manifest data/manifests/kermany.csv
 ```
 
 The best checkpoint is selected primarily by validation recall across `CNV` and `DME`; validation
-loss breaks ties. Evaluation writes per-class sensitivity, specificity, and AUROC plus urgent
-recall, a confusion matrix, and a calibration plot under `reports/metrics/`.
+loss breaks ties. A softmax temperature is then fitted on the validation split and stored in the
+checkpoint, so the confidence and entropy thresholds act on calibrated scores. The temperature is
+never below 1: calibration can soften the model's confidence but never sharpen it. Set
+`calibrate_temperature: false` in `configs/model.yaml` to skip it. Evaluation writes per-class sensitivity, specificity, and AUROC; urgent recall,
+specificity, and precision; a confusion matrix; and a calibration plot under `reports/metrics/`.
+
+Classifier metrics alone do not describe the reading queue, so `test_metrics.json` also contains a
+`triage_policy` section. It replays every test image through the same quality gate, flip
+test-time augmentation, evidence aggregation, and triage rules as the API, then reports how many
+urgent-class cases reach the `URGENT` tier, how many fall below it, how often non-urgent cases are
+flagged `URGENT`, and which escalation reasons fire. A `confidence_intervals` section gives 95%
+intervals for the headline rates by resampling whole patients, because images from one patient
+are correlated and image-level intervals would be falsely narrow. A `provenance` section records
+the model version, temperature, and the SHA-256 of the checkpoint, manifest, and rule files so
+results can be tied to an immutable configuration.
+
+### 3. Select promotion thresholds on the validation split
+
+```bash
+oct-tune-thresholds --manifest data/manifests/kermany.csv --target-sensitivity 0.97
+```
+
+This sweeps a shared `CNV`/`DME` promotion threshold through the full serving policy on the
+validation split and recommends the highest threshold whose urgent-tier sensitivity meets the
+target, which is also the one that flags the fewest non-urgent cases. It writes the full sweep to
+`reports/metrics/threshold_sweep.json` but never edits `configs/triage_rules.yaml`: lock the value
+deliberately, then confirm it with `oct-evaluate` on the untouched test split. It refuses to tune
+on the test split.
 
 No trained checkpoint is committed to this repository. Until training succeeds, `/health`
 returns `model_ready: false` and inference returns HTTP 503 rather than fabricating a result.
+Training records each checkpoint's SHA-256 in `model_registry/registry.json`; the service refuses
+(HTTP 503) a checkpoint whose model version is registered with a different hash, and logs a
+warning when it serves a version that has no registry record.
 
-### 3. Run the service and worklist
+### 4. Run the service and worklist
 
 ```bash
 uvicorn api.main:app --reload
@@ -104,10 +133,11 @@ streamlit run ui/app.py
 Open `http://localhost:8501`. OpenAPI documentation is available at
 `http://localhost:8000/docs`.
 
-### 4. Run with Docker
+### 5. Run with Docker
 
 Place a trained checkpoint at `model_registry/checkpoints/best.pt`, set a private DICOM hashing
-salt, and start both services:
+salt, and start both services. The API image installs CPU PyTorch wheels; the worklist image
+contains only Streamlit and fetches scan images from the API on the server side:
 
 ```bash
 cp .env.example .env
@@ -120,7 +150,9 @@ formal PHI handling, encryption, retention, access-control, and deletion design.
 
 ## API contract
 
-Submit one PNG/JPEG/TIFF image or DICOM object:
+Submit one PNG/JPEG/TIFF image or DICOM object. 16-bit grayscale exports are contrast-scaled
+rather than clipped, and every page of a multi-page TIFF or frame of a multi-frame DICOM is
+assessed as one volume:
 
 ```bash
 curl -X POST http://localhost:8000/v1/triage \
@@ -139,6 +171,7 @@ Example response shape:
   "findings": ["CNV"],
   "class_probabilities": {"CNV": 0.91, "DME": 0.05, "DRUSEN": 0.02, "NORMAL": 0.02},
   "saliency_map_url": "/v1/media/42c2d7e6-8ac8-4980-91d6-ec6a307c8cc2-saliency.png",
+  "saliency_class": "CNV",
   "thumbnail_url": "/v1/media/42c2d7e6-8ac8-4980-91d6-ec6a307c8cc2-thumbnail.png",
   "model_version": "octtriage-20260904T180000Z",
   "timestamp": "2026-09-04T18:01:04+00:00",
@@ -150,18 +183,48 @@ Example response shape:
 }
 ```
 
+Uploads larger than `OCT_MAX_UPLOAD_BYTES` are refused with HTTP 413 before they are buffered,
+and so are scans that would decode to more than `OCT_MAX_SCAN_FRAMES` frames or
+`OCT_MAX_SCAN_PIXELS` pixels, which is checked from the declared geometry before any pixel data is
+decompressed. Each recorded prediction and override is also written to stdout as one JSON line.
+
+`findings` lists the finding that drives the tier first, and `saliency_class` names the class the
+Grad-CAM overlay explains: the driving finding, on the B-scan with the strongest evidence for it.
+`class_probabilities` is aggregated evidence, not a calibrated distribution: pathology classes
+take the maximum over every view and B-scan, and `NORMAL` takes the minimum.
+
 Every successful inference is written to the audit database with its request SHA-256, quality
 assessment, model version, result, timestamp, and evidence paths. `POST /v1/overrides` requires a
 clinician identifier and reason and never destroys the original model decision.
+`GET /v1/predictions/{audit_id}` returns the original response together with its ordered override
+and sign-off history, and `GET /v1/worklist` returns media URLs rather than server file paths.
+
+A clinician closes a study with `POST /v1/reviews`, either confirming the current tier or changing
+it. A change requires a reason and is recorded as an override in the same transaction:
+
+```bash
+curl -X POST http://localhost:8000/v1/reviews -H "Content-Type: application/json" \
+  -d '{"audit_id": "42c2d7e6-...", "final_tier": "URGENT", "clinician_id": "dr-example"}'
+```
+
+`GET /v1/worklist` lists pending studies by default; pass `status=reviewed` or `status=all` for
+the others. An override made after sign-off returns the study to the pending queue.
 
 ## Fail-safe behavior
 
 - Low confidence, high entropy, or test-time-augmentation disagreement escalates to `URGENT`.
+  Augmentation agreement is measured within each B-scan, so ordinary variation across the
+  B-scans of a volume is not mistaken for model uncertainty.
+- Reassurance is never taken from the most optimistic view: `NORMAL` evidence is the minimum
+  across views and B-scans, while pathology evidence is the maximum.
 - An uninterpretable scan is not forced through the classifier; it becomes urgent human review
   with a repeat-acquisition flag.
 - Candidate CNV or DME probabilities can promote a case even when they are not the argmax class.
 - When findings disagree, the highest urgency wins.
 - Automatic downgrade is disabled. Only a logged clinician override can change the displayed tier.
+- The rules file is validated at startup: unknown tier names, a priority order that does not rank
+  `ROUTINE < SEMI_URGENT < URGENT`, or thresholds outside 0–1 stop the service from starting
+  instead of silently weakening the policy.
 
 Thresholds in this repository are conservative engineering defaults, not clinically validated
 operating points. They must be selected and locked through representative validation before any
@@ -174,7 +237,9 @@ ruff check .
 pytest
 ```
 
-CI runs linting and tests for every pull request. The deterministic tier mapping, patient-level
-split invariant, API response contract, audit record, and override record receive direct tests.
+CI runs linting and tests on Python 3.10, 3.11, and 3.12 for every pull request. The
+deterministic tier mapping, rule validation, evidence aggregation, patient-level split invariant,
+image decoding, end-to-end inference with Grad-CAM, a one-epoch train-and-evaluate run, API
+response contract, audit record, and override history receive direct tests.
 
 See [`MODEL_CARD.md`](MODEL_CARD.md) for intended use, limitations, and evaluation requirements.

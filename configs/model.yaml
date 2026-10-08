@@ -1,6 +1,9 @@
 schema_version: "1.0"
 classes: [CNV, DME, DRUSEN, NORMAL]
 urgent_classes: [CNV, DME]
+# Reassuring classes are aggregated by minimum across views and B-scans; pathology classes
+# by maximum, so focal disease evidence is never averaged away.
+non_pathology_classes: [NORMAL]
 backbone: efficientnet_b0
 image_size: 224
 batch_size: 32
@@ -12,3 +15,5 @@ num_workers: 4
 pretrained_imagenet: true
 tta_horizontal_flip: true
 checkpoint_metric: urgent_recall
+# Fit a softmax temperature (never below 1) on the validation split after training.
+calibrate_temperature: true

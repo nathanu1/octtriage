@@ -3,10 +3,12 @@ from __future__ import annotations
 import io
 
 import numpy as np
+import pydicom
+import pytest
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
-from octtriage.data.io import load_scan_bytes
+from octtriage.data.io import ScanTooLargeError, load_scan_bytes
 
 
 def dicom_payload() -> bytes:
@@ -39,3 +41,14 @@ def test_dicom_pixels_and_patient_identifier_are_safely_loaded() -> None:
     assert loaded.frames[0].size == (48, 32)
     assert loaded.patient_hash is not None
     assert loaded.patient_hash != "TEST-PATIENT-001"
+
+
+def test_dicom_declaring_oversized_geometry_is_rejected_before_decoding() -> None:
+    dataset = pydicom.dcmread(io.BytesIO(dicom_payload()))
+    dataset.NumberOfFrames = 4000
+    dataset.Rows = 1024
+    dataset.Columns = 1024
+    buffer = io.BytesIO()
+    dataset.save_as(buffer, enforce_file_format=True)
+    with pytest.raises(ScanTooLargeError):
+        load_scan_bytes(buffer.getvalue(), "volume.dcm", "salt")

@@ -28,6 +28,8 @@ class GradCAM:
         with torch.enable_grad():
             logits = self.model(tensor)
             logits[:, class_index].sum().backward()
+        # Only the hooked activation gradients are needed; release the parameter gradients.
+        self.model.zero_grad(set_to_none=True)
         if self.activations is None or self.gradients is None:
             raise RuntimeError("Grad-CAM hooks did not capture model tensors")
         weights = self.gradients.mean(dim=(2, 3), keepdim=True)

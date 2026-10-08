@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,8 @@ class ModelBundle:
     backbone: str
     model_version: str
     checkpoint_path: Path
+    # Softmax temperature fitted on validation data; 1.0 means uncalibrated.
+    temperature: float = 1.0
 
 
 def build_classifier(
@@ -50,7 +53,8 @@ def load_bundle(checkpoint_path: str | Path, device: torch.device) -> ModelBundl
     path = Path(checkpoint_path)
     if not path.is_file():
         raise FileNotFoundError(f"Model checkpoint not found: {path}")
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    # Checkpoints hold only tensors and plain metadata; refuse arbitrary pickled objects.
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
     required = {"model_state_dict", "classes", "image_size", "model_version", "backbone"}
     missing = required - set(checkpoint)
     if missing:
@@ -62,6 +66,9 @@ def load_bundle(checkpoint_path: str | Path, device: torch.device) -> ModelBundl
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device).eval()
+    temperature = float(checkpoint.get("temperature", 1.0))
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError(f"Checkpoint temperature must be positive, got {temperature}")
     return ModelBundle(
         model=model,
         classes=list(checkpoint["classes"]),
@@ -69,4 +76,5 @@ def load_bundle(checkpoint_path: str | Path, device: torch.device) -> ModelBundl
         backbone=str(checkpoint["backbone"]),
         model_version=str(checkpoint["model_version"]),
         checkpoint_path=path,
+        temperature=temperature,
     )
