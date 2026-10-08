@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,13 +23,14 @@ from octtriage.evaluation.calibration import softmax
 from octtriage.evaluation.metrics import (
     classification_metrics,
     expected_calibration_error,
+    patient_bootstrap_intervals,
     triage_policy_metrics,
 )
-from octtriage.models.classifier import load_bundle
+from octtriage.models.classifier import ModelBundle, load_bundle
 from octtriage.models.registry import sha256_file
 from octtriage.settings import settings
 from octtriage.triage.aggregation import decide_from_views
-from octtriage.triage.engine import TriageEngine
+from octtriage.triage.engine import TriageDecision, TriageEngine
 
 
 class PolicyEvaluationDataset(Dataset):
@@ -87,6 +89,67 @@ def collect_view_logits(
     return np.asarray(targets), np.concatenate(logits), quality_passed, quality_reasons
 
 
+@dataclass(frozen=True)
+class SplitOutputs:
+    """Model outputs for one manifest split, in manifest order."""
+
+    targets: np.ndarray
+    view_logits: np.ndarray
+    view_probabilities: np.ndarray
+    quality_passed: list[bool]
+    quality_reasons: list[list[str]]
+    patient_ids: np.ndarray
+
+
+def run_split(
+    bundle: ModelBundle, manifest: pd.DataFrame, split: str, device: torch.device
+) -> SplitOutputs:
+    dataset = PolicyEvaluationDataset(
+        manifest,
+        split,
+        inference_transform(bundle.image_size),
+        bundle.classes,
+        load_yaml(settings.quality_rules_path),
+    )
+    loader = DataLoader(dataset, batch_size=32, shuffle=False)
+    targets, view_logits, quality_passed, quality_reasons = collect_view_logits(
+        bundle.model, loader, device
+    )
+    return SplitOutputs(
+        targets=targets,
+        view_logits=view_logits,
+        # Every probability uses the checkpoint's fitted temperature, as serving does.
+        view_probabilities=softmax(view_logits, bundle.temperature),
+        quality_passed=quality_passed,
+        quality_reasons=quality_reasons,
+        patient_ids=dataset.frame["patient_id"].astype(str).to_numpy(),
+    )
+
+
+def policy_decisions(
+    engine: TriageEngine,
+    outputs: SplitOutputs,
+    classes: list[str],
+    non_pathology_classes: set[str],
+) -> list[TriageDecision]:
+    """Apply the same quality gate, aggregation, and rules as the serving path to each image."""
+    return [
+        decide_from_views(
+            engine,
+            views[np.newaxis],
+            classes,
+            non_pathology_classes,
+            QualityAssessment(passed=passed, reasons=reasons, metrics={}),
+        )[0]
+        for views, passed, reasons in zip(
+            outputs.view_probabilities,
+            outputs.quality_passed,
+            outputs.quality_reasons,
+            strict=True,
+        )
+    ]
+
+
 def plot_confusion(matrix: list[list[int]], classes: list[str], path: Path) -> None:
     values = np.asarray(matrix)
     fig, axis = plt.subplots(figsize=(6, 5))
@@ -139,46 +202,41 @@ def evaluate(
     urgent_classes = set(model_config["urgent_classes"])
     non_pathology_classes = set(model_config.get("non_pathology_classes", ["NORMAL"]))
     engine = TriageEngine(settings.triage_rules_path)
-    dataset = PolicyEvaluationDataset(
-        manifest,
-        "test",
-        inference_transform(bundle.image_size),
-        bundle.classes,
-        load_yaml(settings.quality_rules_path),
-    )
-    loader = DataLoader(dataset, batch_size=32, shuffle=False)
-    y_true, view_logits, quality_passed, quality_reasons = collect_view_logits(
-        bundle.model, loader, device
-    )
-    # Every probability below uses the checkpoint's fitted temperature, as serving does.
-    view_probabilities = softmax(view_logits, bundle.temperature)
+    outputs = run_split(bundle, manifest, "test", device)
+    y_true = outputs.targets
 
     # Classifier metrics use the un-augmented view of every image, quality gate aside.
-    probabilities = view_probabilities[:, 0, :]
+    probabilities = outputs.view_probabilities[:, 0, :]
     metrics = classification_metrics(y_true, probabilities, bundle.classes, urgent_classes)
     metrics["expected_calibration_error_uncalibrated"] = expected_calibration_error(
-        y_true, softmax(view_logits[:, 0, :])
+        y_true, softmax(outputs.view_logits[:, 0, :])
     )
 
-    # Policy metrics run the same quality gate, aggregation, and rules as the serving path.
-    decisions = [
-        decide_from_views(
-            engine,
-            views[np.newaxis],
-            bundle.classes,
-            non_pathology_classes,
-            QualityAssessment(passed=passed, reasons=reasons, metrics={}),
-        )[0]
-        for views, passed, reasons in zip(
-            view_probabilities, quality_passed, quality_reasons, strict=True
-        )
-    ]
+    decisions = policy_decisions(engine, outputs, bundle.classes, non_pathology_classes)
+    tiers = np.asarray([decision.triage_tier for decision in decisions])
     metrics["triage_policy"] = triage_policy_metrics(
         y_true,
-        [decision.triage_tier for decision in decisions],
+        tiers.tolist(),
         [decision.escalation_reasons for decision in decisions],
         bundle.classes,
         urgent_classes,
+    )
+
+    # Images from one patient are correlated, so resample patients rather than images.
+    true_urgent = np.isin(y_true, [bundle.classes.index(label) for label in urgent_classes])
+    predicted_urgent = np.isin(
+        probabilities.argmax(axis=1), [bundle.classes.index(label) for label in urgent_classes]
+    )
+    triaged_urgent = tiers == "URGENT"
+    metrics["confidence_intervals"] = patient_bootstrap_intervals(
+        outputs.patient_ids,
+        {
+            "accuracy": (probabilities.argmax(axis=1) == y_true, np.ones(len(y_true))),
+            "urgent_recall": (true_urgent & predicted_urgent, true_urgent),
+            "urgent_specificity": (~true_urgent & ~predicted_urgent, ~true_urgent),
+            "urgent_tier_sensitivity": (true_urgent & triaged_urgent, true_urgent),
+            "non_urgent_cases_triaged_urgent_rate": (~true_urgent & triaged_urgent, ~true_urgent),
+        },
     )
     metrics["provenance"] = {
         "model_version": bundle.model_version,
@@ -188,8 +246,8 @@ def evaluate(
         "triage_rules_sha256": sha256_file(settings.triage_rules_path),
         "quality_rules_sha256": sha256_file(settings.quality_rules_path),
         "split": "test",
-        "images": len(dataset),
-        "patients": int(dataset.frame["patient_id"].nunique()),
+        "images": int(len(y_true)),
+        "patients": int(len(np.unique(outputs.patient_ids))),
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
     }
 

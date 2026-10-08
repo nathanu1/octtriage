@@ -17,7 +17,7 @@ from octtriage.config import load_yaml
 from octtriage.data.dataset import OCTManifestDataset
 from octtriage.data.manifest import assert_no_patient_leakage
 from octtriage.data.transforms import inference_transform, training_transform
-from octtriage.evaluation.calibration import fit_temperature, softmax
+from octtriage.evaluation.calibration import MAXIMUM_TEMPERATURE, fit_temperature, softmax
 from octtriage.evaluation.metrics import expected_calibration_error
 from octtriage.models.classifier import build_classifier
 from octtriage.models.registry import register_model
@@ -171,6 +171,11 @@ def train(manifest_path: Path, output_path: Path, config_path: Path, device_name
             f"val_ece={calibration['validation_ece_uncalibrated']:.4f}"
             f"->{calibration['validation_ece']:.4f}"
         )
+        if calibration["temperature"] >= MAXIMUM_TEMPERATURE:
+            print(
+                "warning: the fitted temperature reached its upper bound; validation predictions "
+                "are close to uninformative, so most cases will be escalated."
+            )
     register_model(
         settings.model_registry_path,
         model_version=version,

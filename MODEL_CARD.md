@@ -52,6 +52,9 @@ checkpoint-selection metric. Required reporting also includes:
 - Policy-level outcomes from `oct-evaluate`: the share of urgent cases reaching the `URGENT` tier
   and the share of non-urgent cases flagged `URGENT` after the quality gate, aggregation, and
   uncertainty escalation are applied
+- Patient-level bootstrap confidence intervals for those rates and for urgent recall
+- Promotion thresholds chosen on the validation split with `oct-tune-thresholds`, locked, and only
+  then reported on the test split
 
 Accuracy alone is not an acceptable performance claim.
 

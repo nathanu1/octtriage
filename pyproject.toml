@@ -40,6 +40,7 @@ dev = [
 oct-train = "octtriage.training.train:main"
 oct-evaluate = "octtriage.evaluation.evaluate:main"
 oct-prepare-kermany = "octtriage.data.prepare_kermany:main"
+oct-tune-thresholds = "octtriage.evaluation.thresholds:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

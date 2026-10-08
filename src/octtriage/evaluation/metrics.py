@@ -117,3 +117,49 @@ def triage_policy_metrics(
         "tier_counts_by_true_label": by_label,
         "escalation_reason_counts": dict(sorted(reasons.items())),
     }
+
+
+def patient_bootstrap_intervals(
+    patient_ids: Sequence[str] | np.ndarray,
+    ratios: dict[str, tuple[np.ndarray, np.ndarray]],
+    *,
+    resamples: int = 2000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> dict[str, object]:
+    """Percentile bootstrap intervals for ratio metrics, resampling whole patients.
+
+    Each metric is given as per-image numerator and denominator indicators, for example
+    (urgent and flagged, urgent) for sensitivity. Resampling patients keeps correlated images
+    from one patient together, so intervals are not falsely narrow.
+    """
+    _, patient_index = np.unique(np.asarray(patient_ids), return_inverse=True)
+    patients = int(patient_index.max()) + 1 if len(patient_index) else 0
+    if patients == 0:
+        raise ValueError("At least one patient is required")
+    rng = np.random.default_rng(seed)
+    weights = rng.multinomial(patients, np.full(patients, 1.0 / patients), size=resamples)
+    alpha = (1.0 - confidence) / 2.0
+    intervals: dict[str, object] = {}
+    for name, (numerator, denominator) in ratios.items():
+        per_patient_numerator = np.bincount(
+            patient_index, weights=np.asarray(numerator, dtype=float), minlength=patients
+        )
+        per_patient_denominator = np.bincount(
+            patient_index, weights=np.asarray(denominator, dtype=float), minlength=patients
+        )
+        total = per_patient_denominator.sum()
+        resampled_numerator = weights @ per_patient_numerator
+        resampled_denominator = weights @ per_patient_denominator
+        defined = resampled_denominator > 0
+        values = resampled_numerator[defined] / resampled_denominator[defined]
+        intervals[name] = {
+            "estimate": float(per_patient_numerator.sum() / total) if total > 0 else None,
+            "lower": float(np.quantile(values, alpha)) if values.size else None,
+            "upper": float(np.quantile(values, 1.0 - alpha)) if values.size else None,
+        }
+    intervals["method"] = (
+        f"patient-level percentile bootstrap, {resamples} resamples, "
+        f"{confidence:.0%} interval"
+    )
+    return intervals

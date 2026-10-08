@@ -9,6 +9,7 @@ import torch
 import yaml
 
 from octtriage.evaluation import evaluate as evaluate_module
+from octtriage.evaluation import thresholds as thresholds_module
 from octtriage.settings import settings
 from octtriage.training import train as train_module
 
@@ -70,3 +71,15 @@ def test_training_checkpoint_evaluates_with_policy_metrics(
     assert len(provenance["checkpoint_sha256"]) == 64
     for name in ["test_metrics.json", "confusion_matrix.png", "calibration.png"]:
         assert (tmp_path / "metrics" / name).is_file()
+    intervals = metrics["confidence_intervals"]
+    assert intervals["accuracy"]["lower"] <= intervals["accuracy"]["upper"]
+
+    report = thresholds_module.tune(
+        manifest, checkpoint, tmp_path / "sweep.json", "cpu", target_sensitivity=0.5
+    )
+    assert report["split"] == "val"
+    assert len(report["sweep"]) == len(thresholds_module.DEFAULT_THRESHOLDS)
+    assert report["swept_findings"] == ["CNV", "DME"]
+    assert (tmp_path / "sweep.json").is_file()
+    with pytest.raises(ValueError, match="validation split"):
+        thresholds_module.tune(manifest, checkpoint, tmp_path / "x.json", "cpu", 0.9, split="test")

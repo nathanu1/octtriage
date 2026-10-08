@@ -3,7 +3,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from octtriage.evaluation.metrics import classification_metrics, triage_policy_metrics
+from octtriage.evaluation.metrics import (
+    classification_metrics,
+    patient_bootstrap_intervals,
+    triage_policy_metrics,
+)
 
 CLASSES = ["CNV", "DME", "DRUSEN", "NORMAL"]
 URGENT = {"CNV", "DME"}
@@ -51,3 +55,35 @@ def test_policy_metrics_describe_the_review_queue() -> None:
 def test_policy_metrics_reject_misaligned_inputs() -> None:
     with pytest.raises(ValueError, match="align"):
         triage_policy_metrics(np.array([0, 1]), ["URGENT"], [[], []], CLASSES, URGENT)
+
+
+def test_bootstrap_interval_brackets_the_estimate() -> None:
+    rng = np.random.default_rng(1)
+    correct = rng.random(400) < 0.8
+    intervals = patient_bootstrap_intervals(
+        np.arange(400).astype(str), {"accuracy": (correct, np.ones(400))}, resamples=500
+    )
+    accuracy = intervals["accuracy"]
+    assert accuracy["lower"] <= accuracy["estimate"] <= accuracy["upper"]
+    assert accuracy["estimate"] == pytest.approx(correct.mean())
+    assert "patient-level" in intervals["method"]
+
+
+def test_bootstrap_resamples_patients_not_images() -> None:
+    # Ten patients with 50 images each; half the patients are entirely misclassified.
+    patients = np.repeat(np.arange(10).astype(str), 50)
+    correct = np.repeat([True, False] * 5, 50)
+    by_patient = patient_bootstrap_intervals(
+        patients, {"accuracy": (correct, np.ones(500))}, resamples=1000
+    )["accuracy"]
+    by_image = patient_bootstrap_intervals(
+        np.arange(500).astype(str), {"accuracy": (correct, np.ones(500))}, resamples=1000
+    )["accuracy"]
+    assert by_patient["upper"] - by_patient["lower"] > 2 * (by_image["upper"] - by_image["lower"])
+
+
+def test_bootstrap_reports_undefined_metrics_as_none() -> None:
+    intervals = patient_bootstrap_intervals(
+        ["a", "b"], {"urgent_recall": (np.zeros(2), np.zeros(2))}, resamples=50
+    )
+    assert intervals["urgent_recall"] == {"estimate": None, "lower": None, "upper": None}

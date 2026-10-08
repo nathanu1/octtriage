@@ -93,9 +93,24 @@ Classifier metrics alone do not describe the reading queue, so `test_metrics.jso
 `triage_policy` section. It replays every test image through the same quality gate, flip
 test-time augmentation, evidence aggregation, and triage rules as the API, then reports how many
 urgent-class cases reach the `URGENT` tier, how many fall below it, how often non-urgent cases are
-flagged `URGENT`, and which escalation reasons fire. Use it when tuning the thresholds in
-`configs/triage_rules.yaml`. A `provenance` section records the model version and the SHA-256 of
-the checkpoint, manifest, and rule files so results can be tied to an immutable configuration.
+flagged `URGENT`, and which escalation reasons fire. A `confidence_intervals` section gives 95%
+intervals for the headline rates by resampling whole patients, because images from one patient
+are correlated and image-level intervals would be falsely narrow. A `provenance` section records
+the model version, temperature, and the SHA-256 of the checkpoint, manifest, and rule files so
+results can be tied to an immutable configuration.
+
+### 3. Select promotion thresholds on the validation split
+
+```bash
+oct-tune-thresholds --manifest data/manifests/kermany.csv --target-sensitivity 0.97
+```
+
+This sweeps a shared `CNV`/`DME` promotion threshold through the full serving policy on the
+validation split and recommends the highest threshold whose urgent-tier sensitivity meets the
+target, which is also the one that flags the fewest non-urgent cases. It writes the full sweep to
+`reports/metrics/threshold_sweep.json` but never edits `configs/triage_rules.yaml`: lock the value
+deliberately, then confirm it with `oct-evaluate` on the untouched test split. It refuses to tune
+on the test split.
 
 No trained checkpoint is committed to this repository. Until training succeeds, `/health`
 returns `model_ready: false` and inference returns HTTP 503 rather than fabricating a result.
@@ -103,7 +118,7 @@ Training records each checkpoint's SHA-256 in `model_registry/registry.json`; th
 (HTTP 503) a checkpoint whose model version is registered with a different hash, and logs a
 warning when it serves a version that has no registry record.
 
-### 3. Run the service and worklist
+### 4. Run the service and worklist
 
 ```bash
 uvicorn api.main:app --reload
@@ -118,7 +133,7 @@ streamlit run ui/app.py
 Open `http://localhost:8501`. OpenAPI documentation is available at
 `http://localhost:8000/docs`.
 
-### 4. Run with Docker
+### 5. Run with Docker
 
 Place a trained checkpoint at `model_registry/checkpoints/best.pt`, set a private DICOM hashing
 salt, and start both services. The API image installs CPU PyTorch wheels; the worklist image
