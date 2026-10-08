@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 
 from octtriage.models.classifier import build_classifier
+from octtriage.models.registry import register_model
 from octtriage.serving.errors import ModelUnavailableError
 from octtriage.serving.inference import ModelInferenceService
 from octtriage.settings import Settings
@@ -41,8 +42,10 @@ def checkpoint(tmp_path_factory):
     return path
 
 
-def service_for(checkpoint_path) -> ModelInferenceService:
-    return ModelInferenceService(Settings(checkpoint_path=checkpoint_path), device="cpu")
+def service_for(checkpoint_path, **overrides) -> ModelInferenceService:
+    return ModelInferenceService(
+        Settings(checkpoint_path=checkpoint_path, **overrides), device="cpu"
+    )
 
 
 def test_quality_passing_scan_returns_decision_and_saliency(checkpoint, oct_image) -> None:
@@ -89,3 +92,27 @@ def test_missing_or_corrupt_checkpoint_reports_model_unavailable(tmp_path, oct_i
     corrupt.write_bytes(b"not a checkpoint")
     with pytest.raises(ModelUnavailableError, match="could not be loaded"):
         service_for(corrupt).predict(payload, "scan.png")
+
+
+def test_registered_checkpoint_must_match_its_recorded_hash(
+    checkpoint, tmp_path, oct_image
+) -> None:
+    payload = png_payload(oct_image())
+    manifest = tmp_path / "manifest.csv"
+    manifest.write_text("path,label,patient_id,split\n", encoding="utf-8")
+    registry = tmp_path / "registry.json"
+    register_model(
+        registry,
+        model_version="unit-test-model",
+        checkpoint_path=checkpoint,
+        metrics={},
+        training_manifest=manifest,
+    )
+    result = service_for(checkpoint, model_registry_path=registry).predict(payload, "scan.png")
+    assert result.model_version == "unit-test-model"
+
+    tampered = tmp_path / "tampered.pt"
+    tampered.write_bytes(checkpoint.read_bytes() + b"\0")
+    service = service_for(tampered, model_registry_path=registry)
+    with pytest.raises(ModelUnavailableError, match="does not match the SHA-256"):
+        service.predict(payload, "scan.png")

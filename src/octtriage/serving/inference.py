@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 from dataclasses import dataclass
 
@@ -14,10 +15,13 @@ from octtriage.data.quality import QualityAssessment, assess_quality
 from octtriage.data.transforms import inference_transform
 from octtriage.models.classifier import ModelBundle, gradcam_target_layer, load_bundle
 from octtriage.models.gradcam import GradCAM, overlay_heatmap, png_bytes
+from octtriage.models.registry import verify_registered_checkpoint
 from octtriage.serving.errors import ModelUnavailableError
 from octtriage.settings import Settings, settings
 from octtriage.triage.aggregation import decide_from_views, strongest_frame
 from octtriage.triage.engine import TriageEngine
+
+logger = logging.getLogger("octtriage.serving")
 
 MAX_FRAMES = 32
 INFERENCE_BATCH_SIZE = 32
@@ -68,9 +72,20 @@ class ModelInferenceService:
                     "Train the Kaggle baseline before inference."
                 )
             try:
-                self.bundle = load_bundle(self.settings.checkpoint_path, self.device)
+                bundle = load_bundle(self.settings.checkpoint_path, self.device)
+                registered = verify_registered_checkpoint(
+                    self.settings.model_registry_path,
+                    model_version=bundle.model_version,
+                    checkpoint_path=bundle.checkpoint_path,
+                )
             except Exception as exc:  # noqa: BLE001 - any load failure means no usable model
                 raise ModelNotReadyError(f"Model checkpoint could not be loaded: {exc}") from exc
+            if not registered:
+                logger.warning(
+                    "Serving model version %s, which has no model-registry record",
+                    bundle.model_version,
+                )
+            self.bundle = bundle
         return self.bundle
 
     @staticmethod

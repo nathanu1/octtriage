@@ -96,6 +96,9 @@ the checkpoint, manifest, and rule files so results can be tied to an immutable 
 
 No trained checkpoint is committed to this repository. Until training succeeds, `/health`
 returns `model_ready: false` and inference returns HTTP 503 rather than fabricating a result.
+Training records each checkpoint's SHA-256 in `model_registry/registry.json`; the service refuses
+(HTTP 503) a checkpoint whose model version is registered with a different hash, and logs a
+warning when it serves a version that has no registry record.
 
 ### 3. Run the service and worklist
 
