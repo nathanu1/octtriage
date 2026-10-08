@@ -4,9 +4,8 @@ import json
 import logging
 import threading
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -16,10 +15,12 @@ from api.schemas import (
     OverrideRequest,
     OverrideResponse,
     PredictionDetailResponse,
+    ReviewRequest,
+    ReviewResponse,
     TriageResponse,
 )
 from octtriage.data.io import ScanTooLargeError, UnsupportedScanError
-from octtriage.serving.audit import AuditStore
+from octtriage.serving.audit import AuditStore, utc_now
 from octtriage.serving.errors import ModelUnavailableError
 from octtriage.settings import Settings, settings
 
@@ -190,7 +191,7 @@ def create_app(
 
         audit_id = str(uuid.uuid4())
         resolved_study_id = study_id.strip() if study_id and study_id.strip() else audit_id
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = utc_now()
         media_dir = Path(app_settings.media_dir)
         media_dir.mkdir(parents=True, exist_ok=True)
         thumbnail_path = media_dir / f"{audit_id}-thumbnail.png"
@@ -240,8 +241,10 @@ def create_app(
         return response
 
     @app.get("/v1/worklist")
-    def worklist(limit: int = 100) -> dict[str, object]:
-        items = app.state.audit.list_worklist(min(max(limit, 1), 500))
+    def worklist(
+        limit: int = 100, status: Literal["pending", "reviewed", "all"] = "pending"
+    ) -> dict[str, object]:
+        items = app.state.audit.list_worklist(min(max(limit, 1), 500), status=status)
         for item in items:
             # Expose media URLs; server filesystem paths stay internal to the audit store.
             item["thumbnail_url"] = _media_url(item.pop("thumbnail_path"))
@@ -291,6 +294,30 @@ def create_app(
             )
         )
         return OverrideResponse(**record)
+
+    @app.post("/v1/reviews", response_model=ReviewResponse)
+    def review(request: ReviewRequest) -> ReviewResponse:
+        try:
+            record = app.state.audit.record_review(**_dump(request))
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail="Prediction audit record not found"
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        logger.info(
+            json.dumps(
+                {
+                    "event": "clinician_review_recorded",
+                    "audit_id": record["audit_id"],
+                    "prior_tier": record["prior_tier"],
+                    "final_tier": record["final_tier"],
+                    "override_id": record["override_id"],
+                    "timestamp": record["timestamp"],
+                }
+            )
+        )
+        return ReviewResponse(**record)
 
     return app
 

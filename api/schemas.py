@@ -49,7 +49,27 @@ class OverrideResponse(BaseModel):
     timestamp: str
 
 
+class ReviewRequest(BaseModel):
+    audit_id: str
+    final_tier: Tier
+    clinician_id: str = Field(min_length=1, max_length=128)
+    note: str = Field(default="", max_length=1000)
+
+
+class ReviewResponse(BaseModel):
+    review_id: str
+    audit_id: str
+    prior_tier: Tier
+    final_tier: Tier
+    clinician_id: str
+    note: str
+    override_id: str | None
+    timestamp: str
+
+
 class PredictionDetailResponse(BaseModel):
     prediction: TriageResponse
     overrides: list[OverrideResponse]
+    reviews: list[ReviewResponse]
     effective_tier: Tier
+    review_status: Literal["pending", "reviewed"]

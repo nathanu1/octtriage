@@ -9,9 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+TIERS = {"URGENT", "SEMI_URGENT", "ROUTINE"}
+REVIEW_STATUSES = {"pending", "reviewed", "all"}
+
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    # Fixed-width timestamps keep lexicographic ordering identical to chronological ordering.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 class AuditStore:
@@ -56,6 +60,17 @@ class AuditStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(audit_id) REFERENCES predictions(audit_id)
                 );
+                CREATE TABLE IF NOT EXISTS reviews (
+                    review_id TEXT PRIMARY KEY,
+                    audit_id TEXT NOT NULL,
+                    prior_tier TEXT NOT NULL,
+                    final_tier TEXT NOT NULL,
+                    clinician_id TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    override_id TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(audit_id) REFERENCES predictions(audit_id)
+                );
                 """
             )
 
@@ -91,20 +106,44 @@ class AuditStore:
             )
         return audit_id
 
-    def list_worklist(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_worklist(self, limit: int = 100, status: str = "pending") -> list[dict[str, Any]]:
+        """List studies by effective urgency, then arrival, filtered by review status.
+
+        A study is reviewed once a clinician has signed it off and no override has changed its
+        tier since; an override after sign-off returns it to the pending queue.
+        """
+        if status not in REVIEW_STATUSES:
+            raise ValueError(f"status must be one of {sorted(REVIEW_STATUSES)}")
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT p.*,
-                       (SELECT new_tier FROM overrides o WHERE o.audit_id = p.audit_id
-                        ORDER BY o.created_at DESC LIMIT 1) AS override_tier
-                FROM predictions p
+                WITH items AS (
+                    SELECT p.*,
+                           (SELECT new_tier FROM overrides o WHERE o.audit_id = p.audit_id
+                            ORDER BY o.created_at DESC LIMIT 1) AS override_tier,
+                           (SELECT MAX(created_at) FROM overrides o
+                            WHERE o.audit_id = p.audit_id) AS last_override_at,
+                           (SELECT created_at FROM reviews r WHERE r.audit_id = p.audit_id
+                            ORDER BY r.created_at DESC LIMIT 1) AS reviewed_at,
+                           (SELECT clinician_id FROM reviews r WHERE r.audit_id = p.audit_id
+                            ORDER BY r.created_at DESC LIMIT 1) AS reviewed_by
+                    FROM predictions p
+                ),
+                classified AS (
+                    SELECT items.*,
+                           CASE WHEN reviewed_at IS NOT NULL
+                                 AND (last_override_at IS NULL OR reviewed_at >= last_override_at)
+                                THEN 'reviewed' ELSE 'pending' END AS review_status
+                    FROM items
+                )
+                SELECT * FROM classified
+                WHERE ? = 'all' OR review_status = ?
                 ORDER BY CASE COALESCE(override_tier, triage_tier)
                     WHEN 'URGENT' THEN 2 WHEN 'SEMI_URGENT' THEN 1 ELSE 0 END DESC,
                     created_at ASC
                 LIMIT ?
                 """,
-                (limit,),
+                (status, status, limit),
             ).fetchall()
         worklist: list[dict[str, Any]] = []
         for row in rows:
@@ -112,12 +151,43 @@ class AuditStore:
             item["findings"] = json.loads(item.pop("findings_json"))
             item["quality"] = json.loads(item.pop("quality_json"))
             item.pop("response_json", None)
+            item.pop("last_override_at", None)
             item["effective_tier"] = item["override_tier"] or item["triage_tier"]
+            if item["review_status"] == "pending":
+                item["reviewed_at"] = item["reviewed_by"] = None
             worklist.append(item)
         return worklist
 
+    @staticmethod
+    def _effective_tier(connection: sqlite3.Connection, audit_id: str) -> str:
+        row = connection.execute(
+            "SELECT triage_tier FROM predictions WHERE audit_id = ?", (audit_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(audit_id)
+        latest = connection.execute(
+            "SELECT new_tier FROM overrides WHERE audit_id = ? ORDER BY created_at DESC LIMIT 1",
+            (audit_id,),
+        ).fetchone()
+        return str(latest["new_tier"] if latest else row["triage_tier"])
+
+    @staticmethod
+    def _insert_override(connection: sqlite3.Connection, record: dict[str, str]) -> None:
+        connection.execute(
+            "INSERT INTO overrides VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["override_id"],
+                record["audit_id"],
+                record["original_tier"],
+                record["new_tier"],
+                record["clinician_id"],
+                record["reason"],
+                record["timestamp"],
+            ),
+        )
+
     def get_prediction(self, audit_id: str) -> dict[str, Any]:
-        """Return the original model response with its full, ordered override history."""
+        """Return the original model response with its ordered override and review history."""
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT response_json FROM predictions WHERE audit_id = ?", (audit_id,)
@@ -129,12 +199,27 @@ class AuditStore:
                 "created_at AS timestamp FROM overrides WHERE audit_id = ? ORDER BY created_at",
                 (audit_id,),
             ).fetchall()
+            reviews = connection.execute(
+                "SELECT review_id, audit_id, prior_tier, final_tier, clinician_id, note, "
+                "override_id, created_at AS timestamp FROM reviews WHERE audit_id = ? "
+                "ORDER BY created_at",
+                (audit_id,),
+            ).fetchall()
         prediction = json.loads(row["response_json"])
-        history = [dict(override) for override in overrides]
+        override_history = [dict(override) for override in overrides]
+        review_history = [dict(review) for review in reviews]
+        reviewed = bool(review_history) and (
+            not override_history
+            or review_history[-1]["timestamp"] >= override_history[-1]["timestamp"]
+        )
         return {
             "prediction": prediction,
-            "overrides": history,
-            "effective_tier": history[-1]["new_tier"] if history else prediction["triage_tier"],
+            "overrides": override_history,
+            "reviews": review_history,
+            "effective_tier": (
+                override_history[-1]["new_tier"] if override_history else prediction["triage_tier"]
+            ),
+            "review_status": "reviewed" if reviewed else "pending",
         }
 
     def record_override(
@@ -145,22 +230,12 @@ class AuditStore:
         clinician_id: str,
         reason: str,
     ) -> dict[str, str]:
-        if new_tier not in {"URGENT", "SEMI_URGENT", "ROUTINE"}:
+        if new_tier not in TIERS:
             raise ValueError("Invalid triage tier")
         if not clinician_id.strip() or not reason.strip():
             raise ValueError("Clinician identifier and override reason are required")
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT triage_tier FROM predictions WHERE audit_id = ?", (audit_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(audit_id)
-            latest = connection.execute(
-                "SELECT new_tier FROM overrides WHERE audit_id = ? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (audit_id,),
-            ).fetchone()
-            original = str(latest["new_tier"] if latest else row["triage_tier"])
+            original = self._effective_tier(connection, audit_id)
             record = {
                 "override_id": str(uuid.uuid4()),
                 "audit_id": audit_id,
@@ -170,16 +245,63 @@ class AuditStore:
                 "reason": reason.strip(),
                 "timestamp": utc_now(),
             }
+            self._insert_override(connection, record)
+        return record
+
+    def record_review(
+        self,
+        *,
+        audit_id: str,
+        final_tier: str,
+        clinician_id: str,
+        note: str = "",
+    ) -> dict[str, str | None]:
+        """Sign off a study, recording an override in the same transaction if the tier changes."""
+        if final_tier not in TIERS:
+            raise ValueError("Invalid triage tier")
+        if not clinician_id.strip():
+            raise ValueError("Clinician identifier is required")
+        with self._connect() as connection:
+            prior = self._effective_tier(connection, audit_id)
+            timestamp = utc_now()
+            override_id: str | None = None
+            if final_tier != prior:
+                if len(note.strip()) < 3:
+                    raise ValueError("A reason is required when the reviewed tier differs")
+                override_id = str(uuid.uuid4())
+                self._insert_override(
+                    connection,
+                    {
+                        "override_id": override_id,
+                        "audit_id": audit_id,
+                        "original_tier": prior,
+                        "new_tier": final_tier,
+                        "clinician_id": clinician_id.strip(),
+                        "reason": note.strip(),
+                        "timestamp": timestamp,
+                    },
+                )
+            record: dict[str, str | None] = {
+                "review_id": str(uuid.uuid4()),
+                "audit_id": audit_id,
+                "prior_tier": prior,
+                "final_tier": final_tier,
+                "clinician_id": clinician_id.strip(),
+                "note": note.strip(),
+                "override_id": override_id,
+                "timestamp": timestamp,
+            }
             connection.execute(
-                "INSERT INTO overrides VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO reviews VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    record["override_id"],
+                    record["review_id"],
                     audit_id,
-                    original,
-                    new_tier,
+                    prior,
+                    final_tier,
                     record["clinician_id"],
-                    record["reason"],
-                    record["timestamp"],
+                    record["note"],
+                    override_id,
+                    timestamp,
                 ),
             )
         return record

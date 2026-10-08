@@ -275,3 +275,86 @@ def test_predictions_and_overrides_emit_structured_audit_events(tmp_path) -> Non
         "clinician_override_recorded",
     ]
     assert all(event["audit_id"] == audit_id for event in events)
+
+
+def sign_off(client: TestClient, audit_id: str, final_tier: str, note: str = ""):
+    return client.post(
+        "/v1/reviews",
+        json={
+            "audit_id": audit_id,
+            "final_tier": final_tier,
+            "clinician_id": "clinician-test",
+            "note": note,
+        },
+    )
+
+
+def worklist_ids(client: TestClient, status: str) -> list[str]:
+    items = client.get("/v1/worklist", params={"status": status}).json()["items"]
+    return [item["audit_id"] for item in items]
+
+
+def test_agreeing_sign_off_moves_study_out_of_the_pending_queue(tmp_path) -> None:
+    client = client_for(tmp_path)
+    audit_id = submit(client).json()["audit_id"]
+    assert worklist_ids(client, "pending") == [audit_id]
+
+    review = sign_off(client, audit_id, "URGENT")
+    assert review.status_code == 200
+    assert review.json()["prior_tier"] == "URGENT"
+    assert review.json()["override_id"] is None
+
+    assert worklist_ids(client, "pending") == []
+    assert worklist_ids(client, "reviewed") == [audit_id]
+    assert worklist_ids(client, "all") == [audit_id]
+    reviewed = client.get("/v1/worklist", params={"status": "reviewed"}).json()["items"][0]
+    assert reviewed["reviewed_by"] == "clinician-test"
+    detail = client.get(f"/v1/predictions/{audit_id}").json()
+    assert detail["review_status"] == "reviewed"
+    assert detail["overrides"] == []
+    assert len(detail["reviews"]) == 1
+
+
+def test_sign_off_that_changes_the_tier_requires_a_reason_and_records_an_override(
+    tmp_path,
+) -> None:
+    client = client_for(tmp_path)
+    audit_id = submit(client).json()["audit_id"]
+    assert sign_off(client, audit_id, "ROUTINE").status_code == 422
+    assert client.get(f"/v1/predictions/{audit_id}").json()["reviews"] == []
+
+    review = sign_off(client, audit_id, "ROUTINE", note="Prior imaging shows stable drusen.")
+    assert review.status_code == 200
+    detail = client.get(f"/v1/predictions/{audit_id}").json()
+    assert detail["prediction"]["triage_tier"] == "URGENT"
+    assert detail["effective_tier"] == "ROUTINE"
+    assert detail["review_status"] == "reviewed"
+    [override] = detail["overrides"]
+    assert override["override_id"] == review.json()["override_id"]
+    assert override["reason"] == "Prior imaging shows stable drusen."
+    assert override["original_tier"] == "URGENT"
+
+
+def test_override_after_sign_off_returns_study_to_pending(tmp_path) -> None:
+    client = client_for(tmp_path)
+    audit_id = submit(client).json()["audit_id"]
+    sign_off(client, audit_id, "URGENT")
+    client.post(
+        "/v1/overrides",
+        json={
+            "audit_id": audit_id,
+            "new_tier": "SEMI_URGENT",
+            "clinician_id": "second-reader",
+            "reason": "Second read disagrees.",
+        },
+    )
+    assert worklist_ids(client, "pending") == [audit_id]
+    assert client.get(f"/v1/predictions/{audit_id}").json()["review_status"] == "pending"
+    pending = client.get("/v1/worklist").json()["items"][0]
+    assert pending["reviewed_at"] is None
+
+
+def test_review_validation_errors(tmp_path) -> None:
+    client = client_for(tmp_path)
+    assert sign_off(client, "unknown", "URGENT").status_code == 404
+    assert client.get("/v1/worklist", params={"status": "done"}).status_code == 422

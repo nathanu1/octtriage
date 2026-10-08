@@ -38,7 +38,7 @@ code contains urgency tiers. The engine validates that `HIGHEST_URGENCY_WINS` an
 | `src/octtriage/evaluation/` | Sensitivity, specificity, AUROC, urgent recall, confusion/calibration plots |
 | `src/octtriage/triage/` | Deterministic fail-safe tier mapping |
 | `api/` | Versioned REST endpoints and media delivery |
-| `ui/` | Streamlit worklist, evidence viewer, and override workflow |
+| `ui/` | Streamlit worklist, evidence viewer, and clinician sign-off workflow |
 | `tests/` | Patient-leakage, quality, rules, audit, and API-contract tests |
 | `model_registry/` | Model metadata; large checkpoints are ignored |
 | `docker/` | API and UI container definitions |
@@ -179,7 +179,18 @@ Every successful inference is written to the audit database with its request SHA
 assessment, model version, result, timestamp, and evidence paths. `POST /v1/overrides` requires a
 clinician identifier and reason and never destroys the original model decision.
 `GET /v1/predictions/{audit_id}` returns the original response together with its ordered override
-history, and `GET /v1/worklist` returns media URLs rather than server file paths.
+and sign-off history, and `GET /v1/worklist` returns media URLs rather than server file paths.
+
+A clinician closes a study with `POST /v1/reviews`, either confirming the current tier or changing
+it. A change requires a reason and is recorded as an override in the same transaction:
+
+```bash
+curl -X POST http://localhost:8000/v1/reviews -H "Content-Type: application/json" \
+  -d '{"audit_id": "42c2d7e6-...", "final_tier": "URGENT", "clinician_id": "dr-example"}'
+```
+
+`GET /v1/worklist` lists pending studies by default; pass `status=reviewed` or `status=all` for
+the others. An override made after sign-off returns the study to the pending queue.
 
 ## Fail-safe behavior
 
