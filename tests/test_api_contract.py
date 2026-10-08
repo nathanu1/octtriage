@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -10,6 +12,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from api.main import LazyPredictor, create_app
+from octtriage.data.io import ScanTooLargeError
 from octtriage.serving.audit import AuditStore
 from octtriage.serving.errors import ModelUnavailableError
 from octtriage.settings import Settings
@@ -190,3 +193,85 @@ def test_health_stays_responsive_while_inference_runs(tmp_path) -> None:
             return health.status_code, answered_during_inference, (await triage).status_code
 
     assert asyncio.run(exercise()) == (200, True, 200)
+
+
+def test_body_with_oversized_content_length_is_rejected_before_parsing(tmp_path) -> None:
+    response = submit(client_for(tmp_path, max_upload_bytes=8), payload=b"x" * (2 * 1024 * 1024))
+    assert response.status_code == 413
+    assert response.json()["decision_support_only"] is True
+
+
+def test_oversized_body_without_content_length_is_rejected(tmp_path) -> None:
+    app_settings = settings_for(tmp_path, max_upload_bytes=8)
+    app = create_app(FakePredictor(), AuditStore(app_settings.database_path), app_settings)
+    header = (
+        b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; "
+        b"filename=\"scan.png\"\r\nContent-Type: image/png\r\n\r\n"
+    )
+    chunks = [header, *([b"x" * (1024 * 1024)] * 4), b"\r\n--boundary--\r\n"]
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        body = chunks.pop(0) if chunks else b""
+        return {"type": "http.request", "body": body, "more_body": bool(chunks)}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/triage",
+        "raw_path": b"/v1/triage",
+        "query_string": b"",
+        "root_path": "",
+        # Chunked transfer: no Content-Length, so only the streaming guard can catch it.
+        "headers": [(b"content-type", b"multipart/form-data; boundary=boundary")],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    asyncio.run(app(scope, receive, send))
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 413
+    assert chunks, "the guard should stop reading before the whole body arrives"
+
+
+def test_scan_that_decodes_too_large_returns_413(tmp_path) -> None:
+    class HugeScanPredictor(FakePredictor):
+        def predict(self, payload: bytes, filename: str):
+            raise ScanTooLargeError("Scan has 4000 frames; the limit is 512")
+
+    response = submit(client_for(tmp_path, predictor=HugeScanPredictor()))
+    assert response.status_code == 413
+    assert "4000 frames" in response.json()["detail"]
+
+
+def test_predictions_and_overrides_emit_structured_audit_events(tmp_path) -> None:
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    audit_logger = logging.getLogger("octtriage.audit")
+    audit_logger.addHandler(handler)
+    try:
+        client = client_for(tmp_path)
+        audit_id = submit(client).json()["audit_id"]
+        client.post(
+            "/v1/overrides",
+            json={
+                "audit_id": audit_id,
+                "new_tier": "ROUTINE",
+                "clinician_id": "clinician-test",
+                "reason": "Reviewed the source scan.",
+            },
+        )
+    finally:
+        audit_logger.removeHandler(handler)
+    events = [json.loads(record.getMessage()) for record in records]
+    assert [event["event"] for event in events] == [
+        "prediction_recorded",
+        "clinician_override_recorded",
+    ]
+    assert all(event["audit_id"] == audit_id for event in events)

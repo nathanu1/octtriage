@@ -162,6 +162,11 @@ Example response shape:
 }
 ```
 
+Uploads larger than `OCT_MAX_UPLOAD_BYTES` are refused with HTTP 413 before they are buffered,
+and so are scans that would decode to more than `OCT_MAX_SCAN_FRAMES` frames or
+`OCT_MAX_SCAN_PIXELS` pixels, which is checked from the declared geometry before any pixel data is
+decompressed. Each recorded prediction and override is also written to stdout as one JSON line.
+
 `findings` lists the finding that drives the tier first, and `saliency_class` names the class the
 Grad-CAM overlay explains: the driving finding, on the B-scan with the strongest evidence for it.
 `class_probabilities` is aggregated evidence, not a calibrated distribution: pathology classes

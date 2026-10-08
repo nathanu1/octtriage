@@ -13,6 +13,26 @@ class UnsupportedScanError(ValueError):
     pass
 
 
+class ScanTooLargeError(UnsupportedScanError):
+    pass
+
+
+@dataclass(frozen=True)
+class ScanLimits:
+    max_frames: int = 512
+    max_pixels: int = 256_000_000
+
+    def check(self, frames: int, pixels: int) -> None:
+        if frames > self.max_frames:
+            raise ScanTooLargeError(
+                f"Scan has {frames} frames; the limit is {self.max_frames}"
+            )
+        if pixels > self.max_pixels:
+            raise ScanTooLargeError(
+                f"Scan decodes to {pixels:,} pixels; the limit is {self.max_pixels:,}"
+            )
+
+
 @dataclass(frozen=True)
 class LoadedScan:
     frames: list[Image.Image]
@@ -48,13 +68,27 @@ def _array_to_frames(array: np.ndarray) -> list[Image.Image]:
     return [Image.fromarray(_normalize_array(frame)).convert("RGB") for frame in arrays]
 
 
-def load_dicom_bytes(payload: bytes, patient_hash_salt: str) -> LoadedScan:
+def load_dicom_bytes(
+    payload: bytes, patient_hash_salt: str, limits: ScanLimits | None = None
+) -> LoadedScan:
     try:
         import pydicom
     except ImportError as exc:  # pragma: no cover - dependency error is deployment-specific
         raise UnsupportedScanError("DICOM support requires pydicom") from exc
+    limits = limits or ScanLimits()
     try:
         dataset = pydicom.dcmread(io.BytesIO(payload), force=False)
+    except Exception as exc:  # noqa: BLE001
+        raise UnsupportedScanError(f"Unable to decode DICOM pixel data: {exc}") from exc
+    # Check the declared geometry before decompressing any pixel data.
+    try:
+        frame_count = int(getattr(dataset, "NumberOfFrames", 1) or 1)
+        rows = int(getattr(dataset, "Rows", 0) or 0)
+        columns = int(getattr(dataset, "Columns", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedScanError(f"DICOM image geometry is invalid: {exc}") from exc
+    limits.check(frame_count, frame_count * rows * columns)
+    try:
         pixels = dataset.pixel_array
         try:
             from pydicom.pixels import apply_modality_lut, apply_voi_lut
@@ -87,12 +121,20 @@ def _page_to_rgb(page: Image.Image) -> Image.Image:
     return page.convert("RGB")
 
 
-def load_image_bytes(payload: bytes) -> LoadedScan:
+def load_image_bytes(payload: bytes, limits: ScanLimits | None = None) -> LoadedScan:
+    limits = limits or ScanLimits()
     try:
         image = Image.open(io.BytesIO(payload))
+        limits.check(getattr(image, "n_frames", 1), 0)
         # Multi-page TIFF exports carry a whole volume; triaging only the first B-scan would
         # silently ignore the rest.
-        frames = [_page_to_rgb(page) for page in ImageSequence.Iterator(image)]
+        frames: list[Image.Image] = []
+        pixels = 0
+        for page in ImageSequence.Iterator(image):
+            # Page geometry is known before its pixels are decoded.
+            pixels += page.width * page.height
+            limits.check(len(frames) + 1, pixels)
+            frames.append(_page_to_rgb(page))
     except UnsupportedScanError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -110,10 +152,15 @@ def read_bscan(path: str | Path) -> Image.Image:
     return frames[0]
 
 
-def load_scan_bytes(payload: bytes, filename: str, patient_hash_salt: str) -> LoadedScan:
+def load_scan_bytes(
+    payload: bytes,
+    filename: str,
+    patient_hash_salt: str,
+    limits: ScanLimits | None = None,
+) -> LoadedScan:
     suffix = Path(filename).suffix.lower()
     if suffix in {".dcm", ".dicom"} or payload[:132].endswith(b"DICM"):
-        return load_dicom_bytes(payload, patient_hash_salt)
+        return load_dicom_bytes(payload, patient_hash_salt, limits)
     if suffix not in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
         raise UnsupportedScanError(f"Unsupported file extension: {suffix or '<none>'}")
-    return load_image_bytes(payload)
+    return load_image_bytes(payload, limits)

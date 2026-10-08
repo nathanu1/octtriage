@@ -18,12 +18,21 @@ from api.schemas import (
     PredictionDetailResponse,
     TriageResponse,
 )
-from octtriage.data.io import UnsupportedScanError
+from octtriage.data.io import ScanTooLargeError, UnsupportedScanError
 from octtriage.serving.audit import AuditStore
 from octtriage.serving.errors import ModelUnavailableError
 from octtriage.settings import Settings, settings
 
 logger = logging.getLogger("octtriage.audit")
+if not logger.handlers:
+    # Uvicorn configures only its own loggers; without a handler these events are dropped.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+# Multipart boundaries and form fields add a little to the uploaded file's size.
+MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 API_DISCLAIMER = (
     "Clinical decision-support prototype. This output is not a diagnosis and requires "
     "review by a qualified clinician. Do not use this prototype for patient care."
@@ -55,6 +64,49 @@ class LazyPredictor:
         return self._service.predict(payload, filename)
 
 
+class BodySizeLimitMiddleware:
+    """Reject oversized request bodies before Starlette buffers them to disk."""
+
+    def __init__(self, app: Any, max_body_bytes: int) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    def _too_large(self) -> HTTPException:
+        return HTTPException(status_code=413, detail="Request body exceeds the size limit")
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = dict(scope.get("headers", [])).get(b"content-length")
+        if declared is not None and declared.isdigit() and int(declared) > self.max_body_bytes:
+            error = self._too_large()
+            response = JSONResponse(
+                status_code=error.status_code,
+                content={
+                    "detail": error.detail,
+                    "decision_support_only": True,
+                    "disclaimer": API_DISCLAIMER,
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        received = 0
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_body_bytes:
+                    # FastAPI re-raises HTTPException from body parsing, yielding a 413.
+                    raise self._too_large()
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
 def _dump(model: Any) -> dict[str, Any]:
     return model.model_dump() if hasattr(model, "model_dump") else model.dict()
 
@@ -76,6 +128,10 @@ def create_app(
     app.state.predictor = predictor or LazyPredictor(app_settings)
     app.state.audit = audit_store or AuditStore(app_settings.database_path)
     app.state.settings = app_settings
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        max_body_bytes=app_settings.max_upload_bytes + MULTIPART_OVERHEAD_BYTES,
+    )
 
     @app.exception_handler(HTTPException)
     async def http_error(_request: Request, exc: HTTPException) -> JSONResponse:
@@ -125,6 +181,8 @@ def create_app(
             raise HTTPException(status_code=413, detail="Uploaded scan exceeds the size limit")
         try:
             result = app.state.predictor.predict(payload, file.filename or "scan")
+        except ScanTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
         except UnsupportedScanError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ModelUnavailableError as exc:

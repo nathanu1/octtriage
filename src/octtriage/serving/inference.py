@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 
 from octtriage.config import load_yaml
-from octtriage.data.io import load_scan_bytes
+from octtriage.data.io import ScanLimits, load_scan_bytes
 from octtriage.data.quality import QualityAssessment, assess_quality
 from octtriage.data.transforms import inference_transform
 from octtriage.models.classifier import ModelBundle, gradcam_target_layer, load_bundle
@@ -125,7 +125,12 @@ class ModelInferenceService:
 
     def predict(self, payload: bytes, filename: str) -> InferenceResult:
         request_hash = hashlib.sha256(payload).hexdigest()
-        loaded = load_scan_bytes(payload, filename, self.settings.dicom_hash_salt)
+        loaded = load_scan_bytes(
+            payload,
+            filename,
+            self.settings.dicom_hash_salt,
+            ScanLimits(self.settings.max_scan_frames, self.settings.max_scan_pixels),
+        )
         frames = loaded.frames
         assessments = [assess_quality(frame, self.quality_rules) for frame in frames]
         quality = self._volume_quality(

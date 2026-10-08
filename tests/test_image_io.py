@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from octtriage.data.io import UnsupportedScanError, load_scan_bytes
+from octtriage.data.io import ScanLimits, ScanTooLargeError, UnsupportedScanError, load_scan_bytes
 
 
 def encoded(image: Image.Image, fmt: str, **kwargs) -> bytes:
@@ -46,3 +46,18 @@ def test_undecodable_image_is_rejected() -> None:
 def test_unsupported_extension_is_rejected() -> None:
     with pytest.raises(UnsupportedScanError, match="Unsupported file extension"):
         load_scan_bytes(b"payload", "scan.gif", "salt")
+
+
+def test_volume_with_too_many_pages_is_rejected_before_decoding() -> None:
+    pages = [Image.new("L", (16, 16)) for _ in range(6)]
+    payload = encoded(pages[0], "TIFF", save_all=True, append_images=pages[1:])
+    with pytest.raises(ScanTooLargeError, match="6 frames"):
+        load_scan_bytes(payload, "volume.tiff", "salt", ScanLimits(max_frames=5))
+
+
+def test_scan_exceeding_the_pixel_budget_is_rejected() -> None:
+    pages = [Image.new("L", (100, 100)) for _ in range(3)]
+    payload = encoded(pages[0], "TIFF", save_all=True, append_images=pages[1:])
+    with pytest.raises(ScanTooLargeError, match="pixels"):
+        load_scan_bytes(payload, "volume.tiff", "salt", ScanLimits(max_pixels=25_000))
+    assert len(load_scan_bytes(payload, "volume.tiff", "salt", ScanLimits()).frames) == 3
