@@ -5,6 +5,7 @@ import json
 
 import pandas as pd
 import pytest
+import torch
 import yaml
 
 from octtriage.evaluation import evaluate as evaluate_module
@@ -52,7 +53,13 @@ def test_training_checkpoint_evaluates_with_policy_metrics(
     assert record["active_model_version"] == record["models"][0]["model_version"]
     assert len(record["models"][0]["training_manifest_sha256"]) == 64
 
+    stored = torch.load(checkpoint, weights_only=True)
+    assert stored["temperature"] >= 1.0
+    assert record["models"][0]["metrics"]["temperature"] == stored["temperature"]
+
     metrics = evaluate_module.evaluate(manifest, checkpoint, tmp_path / "metrics", "cpu")
+    assert metrics["provenance"]["temperature"] == stored["temperature"]
+    assert 0.0 <= metrics["expected_calibration_error_uncalibrated"] <= 1.0
     policy = metrics["triage_policy"]
     assert policy["cases"] == len(CLASSES)
     assert sum(sum(counts.values()) for counts in policy["tier_counts_by_true_label"].values()) == 4

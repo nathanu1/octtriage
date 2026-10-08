@@ -18,7 +18,12 @@ from octtriage.data.io import read_bscan
 from octtriage.data.manifest import assert_no_patient_leakage
 from octtriage.data.quality import QualityAssessment, assess_quality
 from octtriage.data.transforms import inference_transform
-from octtriage.evaluation.metrics import classification_metrics, triage_policy_metrics
+from octtriage.evaluation.calibration import softmax
+from octtriage.evaluation.metrics import (
+    classification_metrics,
+    expected_calibration_error,
+    triage_policy_metrics,
+)
 from octtriage.models.classifier import load_bundle
 from octtriage.models.registry import sha256_file
 from octtriage.settings import settings
@@ -62,24 +67,24 @@ class PolicyEvaluationDataset(Dataset):
 
 
 @torch.inference_mode()
-def collect_view_probabilities(
+def collect_view_logits(
     model, loader, device
 ) -> tuple[np.ndarray, np.ndarray, list[bool], list[list[str]]]:
-    """Return targets, softmax outputs shaped (images, views, classes), and quality verdicts."""
+    """Return targets, logits shaped (images, views, classes), and quality verdicts."""
     targets: list[int] = []
-    probabilities: list[np.ndarray] = []
+    logits: list[np.ndarray] = []
     quality_passed: list[bool] = []
     quality_reasons: list[list[str]] = []
     for views, batch_targets, batch_passed, batch_reasons in loader:
         batch, view_count = views.shape[:2]
-        outputs = torch.softmax(model(views.flatten(0, 1).to(device)), dim=1).cpu().numpy()
-        probabilities.append(outputs.reshape(batch, view_count, -1))
+        outputs = model(views.flatten(0, 1).to(device)).cpu().numpy()
+        logits.append(outputs.reshape(batch, view_count, -1))
         targets.extend(batch_targets.numpy().tolist())
         quality_passed.extend(bool(item) for item in batch_passed)
         quality_reasons.extend(
             [reason for reason in item.split("|") if reason] for item in batch_reasons
         )
-    return np.asarray(targets), np.concatenate(probabilities), quality_passed, quality_reasons
+    return np.asarray(targets), np.concatenate(logits), quality_passed, quality_reasons
 
 
 def plot_confusion(matrix: list[list[int]], classes: list[str], path: Path) -> None:
@@ -142,13 +147,18 @@ def evaluate(
         load_yaml(settings.quality_rules_path),
     )
     loader = DataLoader(dataset, batch_size=32, shuffle=False)
-    y_true, view_probabilities, quality_passed, quality_reasons = collect_view_probabilities(
+    y_true, view_logits, quality_passed, quality_reasons = collect_view_logits(
         bundle.model, loader, device
     )
+    # Every probability below uses the checkpoint's fitted temperature, as serving does.
+    view_probabilities = softmax(view_logits, bundle.temperature)
 
     # Classifier metrics use the un-augmented view of every image, quality gate aside.
     probabilities = view_probabilities[:, 0, :]
     metrics = classification_metrics(y_true, probabilities, bundle.classes, urgent_classes)
+    metrics["expected_calibration_error_uncalibrated"] = expected_calibration_error(
+        y_true, softmax(view_logits[:, 0, :])
+    )
 
     # Policy metrics run the same quality gate, aggregation, and rules as the serving path.
     decisions = [
@@ -172,6 +182,7 @@ def evaluate(
     )
     metrics["provenance"] = {
         "model_version": bundle.model_version,
+        "temperature": bundle.temperature,
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "manifest_sha256": sha256_file(manifest_path),
         "triage_rules_sha256": sha256_file(settings.triage_rules_path),

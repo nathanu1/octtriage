@@ -83,7 +83,10 @@ oct-evaluate --manifest data/manifests/kermany.csv
 ```
 
 The best checkpoint is selected primarily by validation recall across `CNV` and `DME`; validation
-loss breaks ties. Evaluation writes per-class sensitivity, specificity, and AUROC; urgent recall,
+loss breaks ties. A softmax temperature is then fitted on the validation split and stored in the
+checkpoint, so the confidence and entropy thresholds act on calibrated scores. The temperature is
+never below 1: calibration can soften the model's confidence but never sharpen it. Set
+`calibrate_temperature: false` in `configs/model.yaml` to skip it. Evaluation writes per-class sensitivity, specificity, and AUROC; urgent recall,
 specificity, and precision; a confusion matrix; and a calibration plot under `reports/metrics/`.
 
 Classifier metrics alone do not describe the reading queue, so `test_metrics.json` also contains a

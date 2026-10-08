@@ -15,3 +15,5 @@ num_workers: 4
 pretrained_imagenet: true
 tta_horizontal_flip: true
 checkpoint_metric: urgent_recall
+# Fit a softmax temperature (never below 1) on the validation split after training.
+calibrate_temperature: true

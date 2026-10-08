@@ -17,6 +17,8 @@ from octtriage.config import load_yaml
 from octtriage.data.dataset import OCTManifestDataset
 from octtriage.data.manifest import assert_no_patient_leakage
 from octtriage.data.transforms import inference_transform, training_transform
+from octtriage.evaluation.calibration import fit_temperature, softmax
+from octtriage.evaluation.metrics import expected_calibration_error
 from octtriage.models.classifier import build_classifier
 from octtriage.models.registry import register_model
 from octtriage.settings import settings
@@ -65,6 +67,34 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None) -> tuple[float, li
             y_true.extend(targets.cpu().tolist())
             y_pred.extend(logits.argmax(dim=1).cpu().tolist())
     return total_loss / max(len(loader.dataset), 1), y_true, y_pred
+
+
+@torch.inference_mode()
+def collect_logits(model, loader, device) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    logits: list[np.ndarray] = []
+    targets: list[int] = []
+    for inputs, batch_targets in loader:
+        logits.append(model(inputs.to(device)).cpu().numpy())
+        targets.extend(batch_targets.tolist())
+    return np.concatenate(logits), np.asarray(targets)
+
+
+def calibrate_checkpoint(model, checkpoint_path: Path, val_loader, device) -> dict[str, float]:
+    """Fit a softmax temperature for the selected checkpoint on the validation split."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    logits, targets = collect_logits(model, val_loader, device)
+    temperature = fit_temperature(logits, targets)
+    calibration = {
+        "temperature": temperature,
+        "validation_ece_uncalibrated": expected_calibration_error(targets, softmax(logits)),
+        "validation_ece": expected_calibration_error(targets, softmax(logits, temperature)),
+    }
+    checkpoint["temperature"] = temperature
+    checkpoint["validation_metrics"] = {**checkpoint["validation_metrics"], **calibration}
+    torch.save(checkpoint, checkpoint_path)
+    return calibration
 
 
 def train(manifest_path: Path, output_path: Path, config_path: Path, device_name: str) -> Path:
@@ -133,6 +163,14 @@ def train(manifest_path: Path, output_path: Path, config_path: Path, device_name
                 },
                 output_path,
             )
+    if bool(config.get("calibrate_temperature", True)):
+        calibration = calibrate_checkpoint(model, output_path, val_loader, device)
+        best_metrics.update(calibration)
+        print(
+            f"temperature={calibration['temperature']:.3f} "
+            f"val_ece={calibration['validation_ece_uncalibrated']:.4f}"
+            f"->{calibration['validation_ece']:.4f}"
+        )
     register_model(
         settings.model_registry_path,
         model_version=version,

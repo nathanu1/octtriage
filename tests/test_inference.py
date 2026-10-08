@@ -116,3 +116,18 @@ def test_registered_checkpoint_must_match_its_recorded_hash(
     service = service_for(tampered, model_registry_path=registry)
     with pytest.raises(ModelUnavailableError, match="does not match the SHA-256"):
         service.predict(payload, "scan.png")
+
+
+def test_checkpoint_temperature_softens_served_confidence(checkpoint, tmp_path, oct_image) -> None:
+    payload = png_payload(oct_image())
+    stored = torch.load(checkpoint, weights_only=True)
+    softened = tmp_path / "softened.pt"
+    torch.save({**stored, "temperature": 5.0}, softened)
+    raw = service_for(checkpoint).predict(payload, "scan.png").class_probabilities
+    calibrated = service_for(softened).predict(payload, "scan.png").class_probabilities
+    assert max(calibrated.values()) < max(raw.values())
+
+    invalid = tmp_path / "invalid.pt"
+    torch.save({**stored, "temperature": 0.0}, invalid)
+    with pytest.raises(ModelUnavailableError, match="temperature must be positive"):
+        service_for(invalid).predict(payload, "scan.png")

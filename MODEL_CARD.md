@@ -26,7 +26,8 @@ does not provide trustworthy severity labels for the proposed severity output.
 ## Model and outputs
 
 - ImageNet-initialized EfficientNet-B0, replaceable with ResNet-18 through configuration
-- Four-class softmax output
+- Four-class softmax output with a temperature fitted on the validation split (constrained to
+  T ≥ 1, so it can only soften confidence)
 - Horizontal-flip test-time augmentation, with agreement measured within each B-scan
 - Grad-CAM overlay for the finding that drives the tier, on the B-scan with the strongest evidence
 - Separate heuristic quality gate
@@ -46,7 +47,7 @@ checkpoint-selection metric. Required reporting also includes:
 - Per-class sensitivity and specificity
 - Per-class one-vs-rest AUROC
 - Confusion matrix
-- Expected calibration error and reliability diagram
+- Expected calibration error (calibrated and uncalibrated) and reliability diagram
 - Performance stratified by site, device, demographic group, and image quality when metadata exists
 - Policy-level outcomes from `oct-evaluate`: the share of urgent cases reaching the `URGENT` tier
   and the share of non-urgent cases flagged `URGENT` after the quality gate, aggregation, and
@@ -64,7 +65,9 @@ Accuracy alone is not an acceptable performance claim.
 - DME severity is unavailable and therefore remains `UNKNOWN`; the default rule escalates it.
 - The model has no validated capability for macular hole, retinal detachment, vitreomacular
   traction, or pathology absent from the training labels.
-- Softmax confidence is not a calibrated probability of disease.
+- Temperature scaling calibrates confidence to accuracy on the Kermany validation split only. It
+  is not a probability of disease, and calibration is expected to degrade under scanner,
+  population, and prevalence shift. The uncertainty thresholds act on this calibrated confidence.
 - Grad-CAM can be plausible while a prediction is wrong and must not be interpreted as causal.
 - Quality heuristics may reject valid scans or accept artifacts.
 - Scanner shift, demographic shift, prevalence shift, and adversarial/corrupted inputs are not

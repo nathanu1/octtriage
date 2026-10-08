@@ -123,7 +123,8 @@ class ModelInferenceService:
         with torch.inference_mode():
             for start in range(0, len(batch), INFERENCE_BATCH_SIZE):
                 chunk = batch[start : start + INFERENCE_BATCH_SIZE].to(self.device)
-                outputs.append(torch.softmax(bundle.model(chunk), dim=1).cpu().numpy())
+                logits = bundle.model(chunk) / bundle.temperature
+                outputs.append(torch.softmax(logits, dim=1).cpu().numpy())
         return np.concatenate(outputs).reshape(len(frames), 2, len(bundle.classes))
 
     def _saliency(
